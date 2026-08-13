@@ -7,7 +7,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <IsPackable>true</IsPackable>
     <PackageId>EventHorizon.LfuCache</PackageId>
-    <Description>A keyed, in-process LFU cache for .NET.</Description>
+    <Description>A keyed, in-process LFU cache.</Description>
     <Authors>EventHorizon contributors</Authors>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>

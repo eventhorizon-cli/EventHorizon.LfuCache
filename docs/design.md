@@ -1,4 +1,4 @@
-# LFU Cache Component Design (.NET 8 / .NET 10)
+# LFU Cache Component Design
 
 [English](design.md) | [简体中文](design.zh-CN.md)
 

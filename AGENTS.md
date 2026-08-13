@@ -2,7 +2,7 @@
 
 ## Scope
 
-- This repository contains one reusable in-process LFU cache package targeting .NET 8 and .NET 10.
+- This repository contains one reusable in-process LFU cache package.
 - Production code lives in `src/EventHorizon.LfuCache`.
 - Unit tests live in `tests/ut/EventHorizon.LfuCache.Tests`.
 - The generic runnable sample lives in `samples/EventHorizon.LfuCache.Sample`.

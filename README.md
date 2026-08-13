@@ -2,8 +2,8 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-`EventHorizon.LfuCache` is an in-process LFU cache for .NET 8 and .NET 10. It integrates with Microsoft dependency
-injection, isolates data by keyspace, expires entries independently, and evicts cold entries in proportional batches.
+`EventHorizon.LfuCache` is an in-process LFU cache. It integrates with Microsoft dependency injection, isolates data
+by keyspace, expires entries independently, and evicts cold entries in proportional batches.
 
 ## Features
 

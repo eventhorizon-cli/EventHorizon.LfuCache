@@ -1,4 +1,4 @@
-# LFU Cache 组件设计（.NET 8 / .NET 10）
+# LFU Cache 组件设计
 
 [English](design.md) | [简体中文](design.zh-CN.md)
 

@@ -2,8 +2,8 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-`EventHorizon.LfuCache` 是面向 .NET 8 与 .NET 10 的进程内 LFU 缓存。它集成 Microsoft 依赖注入，按 keyspace
-隔离数据，支持 entry 独立过期，并按比例批量淘汰冷数据。
+`EventHorizon.LfuCache` 是进程内 LFU 缓存。它集成 Microsoft 依赖注入，按 keyspace 隔离数据，支持 entry
+独立过期，并按比例批量淘汰冷数据。
 
 ## 特性
 
