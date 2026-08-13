@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/EventHorizon.LfuCache/EventHorizon.LfuCache.csproj" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/EventHorizon.LfuCache.Sample/EventHorizon.LfuCache.Sample.csproj" />
+  </Folder>
+  <Folder Name="/tests/ut/">
+    <Project Path="tests/ut/EventHorizon.LfuCache.Tests/EventHorizon.LfuCache.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tests/benchmarks/">
+    <Project Path="tests/benchmarks/EventHorizon.LfuCache.Benchmarks/EventHorizon.LfuCache.Benchmarks.csproj" />
+  </Folder>
+</Solution>
