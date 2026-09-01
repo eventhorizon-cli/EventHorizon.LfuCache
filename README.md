@@ -80,31 +80,22 @@ A `null` method argument uses `DefaultExpiry`; an explicit `TimeSpan.Zero` disab
 Negative expiry values are rejected. `DefaultExpiry` itself must be `null` or positive, where `null` means entries do
 not expire by default.
 
-## Configuration Binding
+## Configuration
 
 ```csharp
 services.AddLfuCache<Guid, string>(
     "profiles",
-    configuration.GetSection("LfuCache:profiles"));
+    options =>
+    {
+        options.Capacity = 10_000;
+        options.DefaultExpiry = TimeSpan.FromMinutes(30);
+        options.MaintenanceInterval = TimeSpan.FromSeconds(10);
+    });
 ```
 
-```json
-{
-  "LfuCache": {
-    "profiles": {
-      "Capacity": 10000,
-      "EvictionRatio": 0.1,
-      "DefaultExpiry": "00:30:00",
-      "MaintenanceInterval": "00:00:10",
-      "DecayInterval": "00:05:00",
-      "OverflowRatio": 0.05
-    }
-  }
-}
-```
-
-Configuration reload replaces one validated immutable snapshot. Invalid runtime values are rejected and the previous
-snapshot remains active.
+Configure a keyspace directly at registration. If an external options source later produces a change, the cache
+replaces its validated immutable snapshot; invalid runtime values are rejected and the previous snapshot remains
+active.
 
 ## Dynamic API
 
@@ -121,14 +112,21 @@ The method type arguments must match the single type pair registered for the key
 
 ## Sample
 
-Run the generic-host sample:
+Run the Web API sample:
 
 ```bash
-dotnet run --project samples/EventHorizon.LfuCache.Sample
+dotnet run --project samples/EventHorizon.LfuCache.Sample -- --urls http://localhost:5057
 ```
 
-It demonstrates keyed DI, entry-specific expiry, `null` values, stampede-protected loading, statistics, and the dynamic
-facade sharing the typed store.
+It injects the keyed typed cache directly into minimal API handlers with
+`[FromKeyedServices("sample")]`. Write and retrieve a value with:
+
+```bash
+curl -X PUT http://localhost:5057/cache/example \
+  -H 'Content-Type: application/json' \
+  -d '{"value":"cached"}'
+curl http://localhost:5057/cache/example
+```
 
 ## Build and Test
 
@@ -145,7 +143,7 @@ dotnet test EventHorizon.LfuCache.slnx -c Release --no-build
 Run the benchmark suite with:
 
 ```bash
-dotnet run --project tests/benchmarks/EventHorizon.LfuCache.Benchmarks -c Release -- --filter '*'
+dotnet run --project tests/EventHorizon.LfuCache.Benchmarks -c Release -- --filter '*'
 ```
 
 The benchmarks compare typed and dynamic cache operations with `ConcurrentDictionary` and `MemoryCache`, and include a

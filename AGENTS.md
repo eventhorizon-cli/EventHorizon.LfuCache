@@ -4,7 +4,7 @@
 
 - This repository contains one reusable in-process LFU cache package.
 - Production code lives in `src/EventHorizon.LfuCache`.
-- Unit tests live in `tests/ut/EventHorizon.LfuCache.Tests`.
+- Unit tests live in `tests/EventHorizon.LfuCache.Tests`.
 - The generic runnable sample lives in `samples/EventHorizon.LfuCache.Sample`.
 - Keep samples generic and do not add application-specific integrations to this repository.
 

@@ -21,7 +21,7 @@ The current implementation includes:
 - single-key stampede protection for `GetOrAdd` / `GetOrAddAsync`.
 
 It does not include distributed consistency, persistence, byte-based accounting, or application integration logic.
-The repository's generic console sample demonstrates only the component API.
+The repository's generic Web API sample demonstrates keyed injection with `[FromKeyedServices("sample")]`.
 
 ## 2. Keyspaces and Type Constraints
 
@@ -64,7 +64,7 @@ public interface ILfuCache<TKey, TValue> where TKey : notnull
     string Keyspace { get; }
     int Count { get; }
 
-    bool TryGet(TKey key, out TValue value);
+    bool TryGet(TKey key, [MaybeNullWhen(false)] out TValue value);
     void Set(TKey key, TValue value, TimeSpan? expiry = null);
 
     TValue GetOrAdd(
@@ -76,7 +76,7 @@ public interface ILfuCache<TKey, TValue> where TKey : notnull
         TKey key,
         Func<TKey, CancellationToken, ValueTask<TValue>> factory,
         TimeSpan? expiry = null,
-        CancellationToken ct = default);
+        CancellationToken cancellationToken = default);
 
     bool Remove(TKey key);
     void Clear();
@@ -93,7 +93,7 @@ public interface ILfuCache
 {
     string Keyspace { get; }
 
-    bool TryGet<TKey, TValue>(TKey key, out TValue value) where TKey : notnull;
+    bool TryGet<TKey, TValue>(TKey key, [MaybeNullWhen(false)] out TValue value) where TKey : notnull;
 
     void Set<TKey, TValue>(TKey key, TValue value, TimeSpan? expiry = null)
         where TKey : notnull;
@@ -108,7 +108,7 @@ public interface ILfuCache
         TKey key,
         Func<TKey, CancellationToken, ValueTask<TValue>> factory,
         TimeSpan? expiry = null,
-        CancellationToken ct = default)
+        CancellationToken cancellationToken = default)
         where TKey : notnull;
 
     bool Remove<TKey, TValue>(TKey key) where TKey : notnull;
@@ -167,6 +167,18 @@ public sealed class LfuCacheOptions
 }
 ```
 
+Applications normally configure it directly when registering the keyspace:
+
+```csharp
+services.AddLfuCache<Guid, string>(
+    "profiles",
+    options =>
+    {
+        options.Capacity = 10_000;
+        options.DefaultExpiry = TimeSpan.FromMinutes(30);
+    });
+```
+
 | Parameter | Meaning |
 | --- | --- |
 | `Capacity` | Entry capacity of the keyspace |
@@ -218,15 +230,19 @@ The registration extensions provide:
 services.AddLfuCache<TKey, TValue>();
 services.AddLfuCache<TKey, TValue>(keyspace);
 services.AddLfuCache<TKey, TValue>(keyspace, configureOptions);
-services.AddLfuCache<TKey, TValue>(keyspace, configurationSection);
 ```
+
+An `IConfiguration` overload is available when an application needs configuration-provider binding, but direct
+configuration is the standard registration form.
 
 Each registration performs the following steps:
 
-1. Idempotently register the catalog, registry, metrics, `TimeProvider.System`, and maintenance service.
-2. Validate that the keyspace is not already bound to another type combination.
-3. Register configuration using the normalized keyspace as the options name.
-4. Register a closed keyed singleton `ILfuCache<TKey, TValue>`.
+1. Idempotently register the catalog, registry, metrics, options validator, `TimeProvider.System`, and maintenance
+   service.
+2. Validate that the keyspace is not already bound to another type combination or occupied by an exact keyed service.
+3. Register configuration using the normalized keyspace as the options name and enable startup validation.
+4. Register a closed keyed singleton internal store and a non-disposable forwarding
+   `ILfuCache<TKey, TValue>` facade.
 5. Idempotently register one keyed singleton `ILfuCache` for the keyspace.
 6. When the keyspace is `default`, additionally register an ordinary singleton; the ordinary service forwards to the
    keyed service, and both are the same instance.
@@ -236,6 +252,10 @@ No keyed open generic is registered.
 Keyed singletons are created lazily by default. `LfuCacheMaintenanceService.StartAsync` enumerates the catalog and
 proactively resolves every typed cache, so the registry contains the unique storage for every keyspace before host
 startup completes and configuration errors are exposed during startup.
+
+Registration throws when an existing keyed service occupies the normalized keyspace, rather than publishing catalog
+metadata that resolves to a different implementation. The catalog and maintenance service resolve the internal store,
+so a public typed-service override registered later cannot prevent keyspace initialization.
 
 ## 6. Data Structures and Concurrency
 
@@ -319,6 +339,10 @@ Concurrent calls for the same key execute the factory only once. After the facto
 atomically published as complete; on failure or cancellation, remove the entry by reference so subsequent calls can
 retry.
 
+Each asynchronous caller's cancellation token cancels only that caller's wait. The factory receives a shared token,
+which is canceled only after every current waiter has canceled. Cache hits return a synchronously completed
+`ValueTask<TValue>`.
+
 An ordinary `Set` may replace an entry whose factory is running. The factory caller still receives its own result, but
 when the factory completes it cannot overwrite the newer entry written by `Set`.
 
@@ -341,6 +365,9 @@ The component has only one `LfuCacheMaintenanceService`. Each cache handle expos
 2. Uses `TimeProvider` to wait until that time, or wakes earlier on a watermark or configuration-change signal.
 3. Runs only keyspaces that are due or need eviction.
 4. Lets each instance independently decide whether to run expiration scanning, decay, or one eviction batch.
+
+A failed maintenance pass is logged and retried after a bounded delay so a permanently failing store cannot create a
+hot loop.
 
 Expiration and decay each maintain a weakly consistent enumeration cursor. Each pass advances within its budget and
 the next pass resumes from the previous position. All physical removals still use reference checks.
@@ -365,6 +392,9 @@ The eviction process:
 
 Entries created less than one second ago do not participate in the first candidate selection round. If there are not
 enough other candidates, include these entries so eviction can make progress.
+
+Entries whose factory is still running are never eviction candidates. If capacity pressure consists only of pending
+entries, eviction schedules a later retry; each factory completion also rechecks the watermarks.
 
 At every `DecayInterval`, incremental scanning shifts frequencies right by one, with a lower bound of 1.
 

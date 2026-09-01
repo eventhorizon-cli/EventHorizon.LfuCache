@@ -19,7 +19,8 @@
 - 单一后台维护循环、统计、指标和结构化日志。
 - 单 key `GetOrAdd` / `GetOrAddAsync` 击穿保护。
 
-不包含分布式一致性、持久化、按字节计量或业务接入逻辑。仓库内的通用 Console sample 只演示组件 API。
+不包含分布式一致性、持久化、按字节计量或业务接入逻辑。仓库内的通用 Web API sample 使用
+`[FromKeyedServices("sample")]` 演示 keyed 注入。
 
 ## 2. keyspace 与类型约束
 
@@ -60,7 +61,7 @@ public interface ILfuCache<TKey, TValue> where TKey : notnull
     string Keyspace { get; }
     int Count { get; }
 
-    bool TryGet(TKey key, out TValue value);
+    bool TryGet(TKey key, [MaybeNullWhen(false)] out TValue value);
     void Set(TKey key, TValue value, TimeSpan? expiry = null);
 
     TValue GetOrAdd(
@@ -72,7 +73,7 @@ public interface ILfuCache<TKey, TValue> where TKey : notnull
         TKey key,
         Func<TKey, CancellationToken, ValueTask<TValue>> factory,
         TimeSpan? expiry = null,
-        CancellationToken ct = default);
+        CancellationToken cancellationToken = default);
 
     bool Remove(TKey key);
     void Clear();
@@ -89,7 +90,7 @@ public interface ILfuCache
 {
     string Keyspace { get; }
 
-    bool TryGet<TKey, TValue>(TKey key, out TValue value) where TKey : notnull;
+    bool TryGet<TKey, TValue>(TKey key, [MaybeNullWhen(false)] out TValue value) where TKey : notnull;
 
     void Set<TKey, TValue>(TKey key, TValue value, TimeSpan? expiry = null)
         where TKey : notnull;
@@ -104,7 +105,7 @@ public interface ILfuCache
         TKey key,
         Func<TKey, CancellationToken, ValueTask<TValue>> factory,
         TimeSpan? expiry = null,
-        CancellationToken ct = default)
+        CancellationToken cancellationToken = default)
         where TKey : notnull;
 
     bool Remove<TKey, TValue>(TKey key) where TKey : notnull;
@@ -160,6 +161,18 @@ public sealed class LfuCacheOptions
 }
 ```
 
+通常在注册 keyspace 时直接配置：
+
+```csharp
+services.AddLfuCache<Guid, string>(
+    "profiles",
+    options =>
+    {
+        options.Capacity = 10_000;
+        options.DefaultExpiry = TimeSpan.FromMinutes(30);
+    });
+```
+
 | 参数 | 含义 |
 | --- | --- |
 | `Capacity` | keyspace 的 entry 容量 |
@@ -207,15 +220,17 @@ public sealed class LfuCacheOptions
 services.AddLfuCache<TKey, TValue>();
 services.AddLfuCache<TKey, TValue>(keyspace);
 services.AddLfuCache<TKey, TValue>(keyspace, configureOptions);
-services.AddLfuCache<TKey, TValue>(keyspace, configurationSection);
 ```
+
+需要通过配置提供程序绑定时仍可使用 `IConfiguration` 重载，但常规注册方式是直接配置。
 
 每次注册执行以下步骤：
 
-1. 幂等注册 catalog、registry、metrics、`TimeProvider.System` 和维护服务。
-2. 校验该 keyspace 尚未绑定其他类型组合。
-3. 以归一化 keyspace 作为 options name 注册配置。
-4. 注册闭合的 keyed singleton `ILfuCache<TKey, TValue>`。
+1. 幂等注册 catalog、registry、metrics、options validator、`TimeProvider.System` 和维护服务。
+2. 校验该 keyspace 尚未绑定其他类型组合，也未被精确 keyed service 占用。
+3. 以归一化 keyspace 作为 options name 注册配置，并启用启动时验证。
+4. 注册闭合的 keyed singleton 内部 store，以及不实现 `IDisposable` 的
+   `ILfuCache<TKey, TValue>` 转发 facade。
 5. 为 keyspace 幂等注册一个 keyed singleton `ILfuCache`。
 6. keyspace 为 `default` 时额外注册普通 singleton；普通服务转发到 keyed 服务，二者是同一实例。
 
@@ -223,6 +238,9 @@ services.AddLfuCache<TKey, TValue>(keyspace, configurationSection);
 
 keyed singleton 默认延迟创建。`LfuCacheMaintenanceService.StartAsync` 遍历 catalog 并主动解析全部 typed cache，
 使 registry 在宿主启动完成前包含每个 keyspace 的唯一存储，配置错误也在启动阶段暴露。
+
+如果已有 keyed service 占用了归一化后的 keyspace，注册会直接抛出异常，避免 catalog 元数据与实际解析到的实现不一致。
+catalog 和维护服务解析内部 store，因此之后注册的公开 typed service override 不会阻止 keyspace 初始化。
 
 ## 6. 数据结构与并发
 
@@ -302,6 +320,9 @@ expiry、维护周期、衰减周期和保护窗口统一使用注入的 `TimePr
 同一个 key 的并发调用只执行一次 factory。factory 成功后将原 entry 原子发布为已完成状态；
 失败或取消时引用比对移除 entry，使后续调用可以重试。
 
+每个异步调用者的 cancellation token 只取消自己的等待。factory 接收共享 token，只有当前所有等待者都取消后
+才会取消该 token。缓存命中时返回同步完成的 `ValueTask<TValue>`。
+
 普通 `Set` 可以替换正在执行 factory 的 entry。此时 factory 的调用者仍收到自己的结果，但 factory 完成后不能覆盖
 `Set` 写入的新 entry。
 
@@ -323,6 +344,8 @@ expiry、维护周期、衰减周期和保护窗口统一使用注入的 `TimePr
 3. 只运行已经到期或待淘汰的 keyspace。
 4. 每个实例独立判断是否执行过期扫描、衰减或一个淘汰批次。
 
+维护执行失败时会记录日志，并在有界延迟后重试，避免持续失败的 store 形成热循环。
+
 过期和衰减各自保存弱一致枚举游标，每次按预算推进，下次从上一位置继续。所有物理删除仍使用引用比对。
 
 ## 9. 批量淘汰
@@ -343,6 +366,9 @@ keyspace 使用三条水位：
 4. 引用比对删除候选，更新 eviction 和 batch 统计。
 
 创建不足 1 秒的 entry 第一轮不参与候选选择；若其他候选不足，再纳入这些 entry，保证淘汰可以推进。
+
+factory 仍在执行的 pending entry 永远不作为淘汰候选。如果容量压力全部来自 pending entry，淘汰会安排稍后重试；
+每个 factory 完成时也会重新检查水位。
 
 每过一个 `DecayInterval`，增量扫描将频次右移一位，下限为 1。
 

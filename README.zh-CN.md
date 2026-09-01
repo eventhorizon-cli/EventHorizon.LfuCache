@@ -78,30 +78,21 @@ cache.Set(key, value, TimeSpan.Zero);           // 永不过期。
 方法参数为 `null` 时使用 `DefaultExpiry`；显式传入 `TimeSpan.Zero` 时，该 entry 永不过期。负数会被拒绝。
 `DefaultExpiry` 本身只能为 `null` 或正数，其中 `null` 表示默认永不过期。
 
-## 配置绑定
+## 配置
 
 ```csharp
 services.AddLfuCache<Guid, string>(
     "profiles",
-    configuration.GetSection("LfuCache:profiles"));
+    options =>
+    {
+        options.Capacity = 10_000;
+        options.DefaultExpiry = TimeSpan.FromMinutes(30);
+        options.MaintenanceInterval = TimeSpan.FromSeconds(10);
+    });
 ```
 
-```json
-{
-  "LfuCache": {
-    "profiles": {
-      "Capacity": 10000,
-      "EvictionRatio": 0.1,
-      "DefaultExpiry": "00:30:00",
-      "MaintenanceInterval": "00:00:10",
-      "DecayInterval": "00:05:00",
-      "OverflowRatio": 0.05
-    }
-  }
-}
-```
-
-配置 reload 会整体替换一份经过校验的不可变快照。运行期非法配置会被拒绝，并继续使用上一份有效快照。
+通常在注册时直接配置 keyspace。外部 options 源后续触发变更时，缓存会整体替换一份经过校验的不可变快照；
+运行期非法配置会被拒绝，并继续使用上一份有效快照。
 
 ## 动态接口
 
@@ -116,13 +107,20 @@ cache.Set<Guid, string>(profileId, profileName, TimeSpan.FromMinutes(5));
 
 ## Sample
 
-运行通用 Host sample：
+运行 Web API sample：
 
 ```bash
-dotnet run --project samples/EventHorizon.LfuCache.Sample
+dotnet run --project samples/EventHorizon.LfuCache.Sample -- --urls http://localhost:5057
 ```
 
-它演示 keyed DI、entry 独立 expiry、`null` 值、带击穿保护的加载、统计，以及与类型化存储共享数据的动态接口。
+它通过 `[FromKeyedServices("sample")]` 将类型化 keyed cache 直接注入 minimal API handler。可用以下命令写入和读取：
+
+```bash
+curl -X PUT http://localhost:5057/cache/example \
+  -H 'Content-Type: application/json' \
+  -d '{"value":"cached"}'
+curl http://localhost:5057/cache/example
+```
 
 ## 构建与测试
 
@@ -139,7 +137,7 @@ dotnet test EventHorizon.LfuCache.slnx -c Release --no-build
 运行 benchmark：
 
 ```bash
-dotnet run --project tests/benchmarks/EventHorizon.LfuCache.Benchmarks -c Release -- --filter '*'
+dotnet run --project tests/EventHorizon.LfuCache.Benchmarks -c Release -- --filter '*'
 ```
 
 benchmark 对比类型化接口、动态接口、`ConcurrentDictionary` 与 `MemoryCache`，并包含容量压力下的淘汰负载。

@@ -1,4 +1,8 @@
-using EventHorizon.LfuCache.Internal;
+using EventHorizon.LfuCache.Configuration;
+using EventHorizon.LfuCache.Maintenance;
+using EventHorizon.LfuCache.Metrics;
+using EventHorizon.LfuCache.Registration;
+using EventHorizon.LfuCache.Storage;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -12,6 +16,10 @@ namespace EventHorizon.LfuCache;
 public static class LfuCacheServiceCollectionExtensions
 {
     /// <summary>Registers an LFU cache in the <c>default</c> keyspace.</summary>
+    /// <typeparam name="TKey">The cache key type.</typeparam>
+    /// <typeparam name="TValue">The cache value type.</typeparam>
+    /// <param name="services">The service collection to add the cache to.</param>
+    /// <returns>The same service collection so that additional calls can be chained.</returns>
     public static IServiceCollection AddLfuCache<TKey, TValue>(this IServiceCollection services)
         where TKey : notnull
     {
@@ -19,6 +27,11 @@ public static class LfuCacheServiceCollectionExtensions
     }
 
     /// <summary>Registers an LFU cache in the specified keyspace.</summary>
+    /// <typeparam name="TKey">The cache key type.</typeparam>
+    /// <typeparam name="TValue">The cache value type.</typeparam>
+    /// <param name="services">The service collection to add the cache to.</param>
+    /// <param name="keyspace">The keyspace name. Whitespace and casing are normalized.</param>
+    /// <returns>The same service collection so that additional calls can be chained.</returns>
     public static IServiceCollection AddLfuCache<TKey, TValue>(
         this IServiceCollection services,
         string? keyspace)
@@ -28,6 +41,12 @@ public static class LfuCacheServiceCollectionExtensions
     }
 
     /// <summary>Registers and configures an LFU cache in the specified keyspace.</summary>
+    /// <typeparam name="TKey">The cache key type.</typeparam>
+    /// <typeparam name="TValue">The cache value type.</typeparam>
+    /// <param name="services">The service collection to add the cache to.</param>
+    /// <param name="keyspace">The keyspace name. Whitespace and casing are normalized.</param>
+    /// <param name="configureOptions">The delegate used to configure this keyspace.</param>
+    /// <returns>The same service collection so that additional calls can be chained.</returns>
     public static IServiceCollection AddLfuCache<TKey, TValue>(
         this IServiceCollection services,
         string? keyspace,
@@ -43,6 +62,12 @@ public static class LfuCacheServiceCollectionExtensions
     }
 
     /// <summary>Registers an LFU cache and binds its options from configuration.</summary>
+    /// <typeparam name="TKey">The cache key type.</typeparam>
+    /// <typeparam name="TValue">The cache value type.</typeparam>
+    /// <param name="services">The service collection to add the cache to.</param>
+    /// <param name="keyspace">The keyspace name. Whitespace and casing are normalized.</param>
+    /// <param name="configuration">The configuration section to bind to this keyspace.</param>
+    /// <returns>The same service collection so that additional calls can be chained.</returns>
     public static IServiceCollection AddLfuCache<TKey, TValue>(
         this IServiceCollection services,
         string? keyspace,
@@ -63,13 +88,28 @@ public static class LfuCacheServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(services);
 
         var normalized = KeyspaceNames.Normalize(keyspace);
-        var catalog = GetOrAddCatalog(services);
-        catalog.Add(normalized, typeof(TKey), typeof(TValue), typeof(ILfuCache<TKey, TValue>));
+        var catalog = GetCatalog(services);
+        if (catalog is null || !catalog.TryGetRegistration(normalized, out _))
+        {
+            EnsureServiceSlotsAvailable<TKey, TValue>(services, catalog, normalized);
+        }
+
+        catalog ??= AddCatalog(services);
+        var registrationAdded = catalog.Add(
+            normalized,
+            typeof(TKey),
+            typeof(TValue),
+            typeof(LfuCache<TKey, TValue>));
 
         services.TryAddSingleton<LfuCacheRegistry>();
         services.TryAddSingleton<LfuCacheMetrics>();
+        services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<IValidateOptions<LfuCacheOptions>, LfuCacheOptionsValidator>());
         services.TryAddSingleton<TimeProvider>(TimeProvider.System);
-        services.AddOptions<LfuCacheOptions>(normalized);
+        if (registrationAdded)
+        {
+            services.AddOptions<LfuCacheOptions>(normalized).ValidateOnStart();
+        }
 
         if (!services.Any(descriptor => descriptor.ServiceType == typeof(LfuCacheMaintenanceService)))
         {
@@ -78,16 +118,23 @@ public static class LfuCacheServiceCollectionExtensions
                 serviceProvider => serviceProvider.GetRequiredService<LfuCacheMaintenanceService>());
         }
 
-        services.TryAddKeyedSingleton<ILfuCache<TKey, TValue>>(
-            normalized,
-            (serviceProvider, _) => CreateCache<TKey, TValue>(serviceProvider, normalized));
-        services.TryAddKeyedSingleton<ILfuCache>(
-            normalized,
-            (serviceProvider, _) => CreateDynamicCache(serviceProvider, normalized));
+        if (registrationAdded)
+        {
+            services.AddKeyedSingleton<LfuCache<TKey, TValue>>(
+                normalized,
+                (serviceProvider, _) => CreateCache<TKey, TValue>(serviceProvider, normalized));
+            services.TryAddKeyedSingleton<ILfuCache<TKey, TValue>>(
+                normalized,
+                (serviceProvider, _) => new TypedLfuCacheFacade<TKey, TValue>(
+                    serviceProvider.GetRequiredKeyedService<LfuCache<TKey, TValue>>(normalized)));
+            services.TryAddKeyedSingleton<ILfuCache>(
+                normalized,
+                (serviceProvider, _) => CreateDynamicCache(serviceProvider, normalized));
+        }
 
         RegisterNormalizedFallback<TKey, TValue>(services);
 
-        if (normalized == KeyspaceNames.Default)
+        if (registrationAdded && normalized == KeyspaceNames.Default)
         {
             services.TryAddSingleton<ILfuCache<TKey, TValue>>(
                 serviceProvider => serviceProvider.GetRequiredKeyedService<ILfuCache<TKey, TValue>>(normalized));
@@ -135,15 +182,60 @@ public static class LfuCacheServiceCollectionExtensions
             (serviceProvider, requestedKey) =>
             {
                 var normalized = GetRegisteredKeyspace<TKey, TValue>(serviceProvider, requestedKey);
-                return serviceProvider.GetRequiredKeyedService<ILfuCache<TKey, TValue>>(normalized);
+                var cache = serviceProvider.GetRequiredKeyedService<ILfuCache<TKey, TValue>>(normalized);
+                return cache is IDisposable or IAsyncDisposable
+                    ? new TypedLfuCacheFacade<TKey, TValue>(cache)
+                    : cache;
             });
         services.TryAddKeyedTransient<ILfuCache>(
             KeyedService.AnyKey,
             (serviceProvider, requestedKey) =>
             {
                 var normalized = GetRegisteredKeyspace(serviceProvider, requestedKey);
-                return serviceProvider.GetRequiredKeyedService<ILfuCache>(normalized);
+                var cache = serviceProvider.GetRequiredKeyedService<ILfuCache>(normalized);
+                return cache is IDisposable or IAsyncDisposable
+                    ? new DynamicLfuCacheFacade(cache)
+                    : cache;
             });
+    }
+
+    private static void EnsureServiceSlotsAvailable<TKey, TValue>(
+        IServiceCollection services,
+        LfuCacheCatalog? catalog,
+        string keyspace)
+        where TKey : notnull
+    {
+        var registrations = catalog?.GetRegistrations() ?? [];
+        var typedFallbackRegistered = registrations.Any(
+            registration => registration.KeyType == typeof(TKey) && registration.ValueType == typeof(TValue));
+        EnsureKeyedServiceSlotAvailable(
+            services,
+            typeof(ILfuCache<TKey, TValue>),
+            keyspace,
+            rejectAnyKey: !typedFallbackRegistered);
+        EnsureKeyedServiceSlotAvailable(
+            services,
+            typeof(ILfuCache),
+            keyspace,
+            rejectAnyKey: registrations.Length == 0);
+    }
+
+    private static void EnsureKeyedServiceSlotAvailable(
+        IServiceCollection services,
+        Type serviceType,
+        string keyspace,
+        bool rejectAnyKey)
+    {
+        if (services.Any(descriptor => descriptor.IsKeyedService
+            && descriptor.ServiceType == serviceType
+            && ((rejectAnyKey && Equals(descriptor.ServiceKey, KeyedService.AnyKey))
+                || (descriptor.ServiceKey is string registeredKeyspace
+                    && StringComparer.Ordinal.Equals(KeyspaceNames.Normalize(registeredKeyspace), keyspace)))))
+        {
+            throw new InvalidOperationException(
+                $"Cannot register LFU cache keyspace '{keyspace}' because keyed service " +
+                $"'{serviceType}' is already registered.");
+        }
     }
 
     private static string GetRegisteredKeyspace<TKey, TValue>(
@@ -183,7 +275,7 @@ public static class LfuCacheServiceCollectionExtensions
         return normalized;
     }
 
-    private static LfuCacheCatalog GetOrAddCatalog(IServiceCollection services)
+    private static LfuCacheCatalog? GetCatalog(IServiceCollection services)
     {
         var descriptor = services.FirstOrDefault(item => item.ServiceType == typeof(LfuCacheCatalog));
         if (descriptor?.ImplementationInstance is LfuCacheCatalog catalog)
@@ -197,7 +289,12 @@ public static class LfuCacheServiceCollectionExtensions
                 $"{nameof(LfuCacheCatalog)} must be registered by {nameof(AddLfuCache)}.");
         }
 
-        catalog = new LfuCacheCatalog();
+        return null;
+    }
+
+    private static LfuCacheCatalog AddCatalog(IServiceCollection services)
+    {
+        var catalog = new LfuCacheCatalog();
         services.AddSingleton(catalog);
         return catalog;
     }

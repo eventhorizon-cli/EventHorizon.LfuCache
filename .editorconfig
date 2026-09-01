@@ -40,5 +40,14 @@ dotnet_naming_symbols.private_fields.applicable_accessibilities = private
 dotnet_naming_style.private_field_style.capitalization = camel_case
 dotnet_naming_style.private_field_style.required_prefix = _
 
+[src/EventHorizon.LfuCache/ILfuCache*.cs]
+# Set is the established cache API name; renaming it would be a breaking change for a cross-language edge case.
+dotnet_diagnostic.CA1716.severity = none
+
 [tests/**/*.cs]
 dotnet_naming_rule.types_should_be_pascal_case.severity = none
+dotnet_diagnostic.CA1707.severity = none
+
+[tests/EventHorizon.LfuCache.Benchmarks/*.cs]
+# BenchmarkDotNet calls methods marked with GlobalCleanup to release owned resources.
+dotnet_diagnostic.CA1001.severity = none
