@@ -7,5 +7,9 @@ TestResults/
 *.suo
 *.nupkg
 *.snupkg
-coverage.*
+coverage*.json
+coverage*.xml
+coverage*.info
+*.coverage
+*.coveragexml
 BenchmarkDotNet.Artifacts/

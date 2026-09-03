@@ -382,7 +382,8 @@ factory 仍在执行的 pending entry 永远不作为淘汰候选。如果容量
 
 ## 10. 可观测性
 
-使用 `System.Diagnostics.Metrics` 发布：
+组件通过名为 `EventHorizon.LfuCache` 的 `System.Diagnostics.Metrics` Meter 发布指标。OpenTelemetry SDK 宿主可通过
+`MeterProviderBuilder.AddLfuCacheInstrumentation()` 订阅：
 
 - Counter：`lfu_cache.hits`、`lfu_cache.misses`、`lfu_cache.evictions`、
   `lfu_cache.expirations`、`lfu_cache.eviction.batches`、`lfu_cache.eviction.synchronous`。

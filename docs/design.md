@@ -408,7 +408,8 @@ At every `DecayInterval`, incremental scanning shifts frequencies right by one, 
 
 ## 10. Observability
 
-The component publishes through `System.Diagnostics.Metrics`:
+The component publishes through the `EventHorizon.LfuCache` `System.Diagnostics.Metrics` meter. OpenTelemetry SDK
+hosts subscribe to it with `MeterProviderBuilder.AddLfuCacheInstrumentation()`:
 
 - Counter: `lfu_cache.hits`, `lfu_cache.misses`, `lfu_cache.evictions`,
   `lfu_cache.expirations`, `lfu_cache.eviction.batches`, `lfu_cache.eviction.synchronous`.

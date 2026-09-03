@@ -110,6 +110,22 @@ cache.Set<Guid, string>(profileId, profileName, TimeSpan.FromMinutes(5));
 The method type arguments must match the single type pair registered for the keyspace; mismatches throw
 `InvalidOperationException`.
 
+## OpenTelemetry
+
+Register the cache's `EventHorizon.LfuCache` meter with an OpenTelemetry metrics pipeline by calling
+`AddLfuCacheInstrumentation`:
+
+```csharp
+using EventHorizon.LfuCache;
+
+services.AddOpenTelemetry()
+    .WithMetrics(metrics => metrics
+        .AddLfuCacheInstrumentation());
+```
+
+Configure the exporter separately in the host application. The cache publishes counters, observable gauges, and an
+eviction-duration histogram with `keyspace` and `value_type` tags.
+
 ## Sample
 
 Run the Web API sample:

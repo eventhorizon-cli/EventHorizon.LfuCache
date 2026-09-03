@@ -1,0 +1,150 @@
+name: NuGet Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: eventhorizon-lfu-cache-release
+  cancel-in-progress: false
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  DOTNET_NOLOGO: "true"
+  NUGET_SOURCE: https://api.nuget.org/v3/index.json
+  NUGET_PACKAGES: ${{ github.workspace }}/.nuget/packages
+  SOLUTION: EventHorizon.LfuCache.slnx
+  PACKAGE_PROJECT: src/EventHorizon.LfuCache/EventHorizon.LfuCache.csproj
+  TEST_PROJECT: tests/EventHorizon.LfuCache.Tests/EventHorizon.LfuCache.Tests.csproj
+  PACKAGE_ID: EventHorizon.LfuCache
+
+jobs:
+  publish:
+    name: Build and publish package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Resolve stable package version
+        id: version
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          stable_tag_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+
+          if [[ ! "$TAG_NAME" =~ $stable_tag_pattern ]]; then
+            echo "::error title=Invalid release tag::Expected v<major>.<minor>.<patch> without a prerelease suffix; received '$TAG_NAME'."
+            exit 1
+          fi
+
+          echo "value=${TAG_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Validate NuGet credentials
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        shell: bash
+        run: |
+          if [[ -z "$NUGET_API_KEY" ]]; then
+            echo "::error title=Missing NuGet publishing credential::Set the NUGET_API_KEY repository secret."
+            exit 1
+          fi
+
+      - name: Restore
+        run: dotnet restore "$SOLUTION"
+
+      - name: Verify formatting
+        run: dotnet format "$SOLUTION" --no-restore --verify-no-changes --verbosity diagnostic
+
+      - name: Build
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: >-
+          dotnet build "$SOLUTION"
+          --configuration Release
+          --no-restore
+          -p:Version="$VERSION"
+          -p:ContinuousIntegrationBuild=true
+
+      - name: Test
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: >-
+          dotnet test "$TEST_PROJECT"
+          --configuration Release
+          --no-build
+          --no-restore
+          -p:Version="$VERSION"
+
+      - name: Pack
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: >-
+          dotnet pack "$PACKAGE_PROJECT"
+          --configuration Release
+          --no-build
+          --no-restore
+          --output artifacts
+          -p:Version="$VERSION"
+          -p:ContinuousIntegrationBuild=true
+
+      - name: Publish package to NuGet
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          VERSION: ${{ steps.version.outputs.value }}
+        shell: bash
+        run: |
+          package="artifacts/$PACKAGE_ID.$VERSION.nupkg"
+          symbols="artifacts/$PACKAGE_ID.$VERSION.snupkg"
+          test -f "$package"
+          test -f "$symbols"
+          dotnet nuget push "$package" --api-key "$NUGET_API_KEY" --source "$NUGET_SOURCE" --skip-duplicate
+
+      - name: Wait for package availability on NuGet
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        shell: bash
+        run: |
+          package_id="${PACKAGE_ID,,}"
+          package_url="https://api.nuget.org/v3-flatcontainer/$package_id/$VERSION/$package_id.nuspec"
+
+          for attempt in {1..30}; do
+            if curl --fail --silent --output /dev/null "$package_url"; then
+              echo "$PACKAGE_ID $VERSION is available on NuGet."
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "::error title=NuGet package unavailable::$PACKAGE_ID $VERSION was not available after five minutes."
+          exit 1
+
+      - name: Create GitHub Release with packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.value }}
+        shell: bash
+        run: |
+          package="artifacts/$PACKAGE_ID.$VERSION.nupkg"
+          symbols="artifacts/$PACKAGE_ID.$VERSION.snupkg"
+          test -f "$package"
+          test -f "$symbols"
+          gh release create "$GITHUB_REF_NAME" "$package" "$symbols" \
+            --verify-tag \
+            --title "EventHorizon.LfuCache $VERSION" \
+            --generate-notes

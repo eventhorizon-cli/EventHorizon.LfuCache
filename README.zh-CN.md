@@ -105,6 +105,22 @@ cache.Set<Guid, string>(profileId, profileName, TimeSpan.FromMinutes(5));
 
 方法类型参数必须与该 keyspace 唯一注册的类型组合一致，否则会抛出 `InvalidOperationException`。
 
+## OpenTelemetry
+
+调用 `AddLfuCacheInstrumentation`，即可把缓存的 `EventHorizon.LfuCache` Meter 注册到 OpenTelemetry metrics
+pipeline：
+
+```csharp
+using EventHorizon.LfuCache;
+
+services.AddOpenTelemetry()
+    .WithMetrics(metrics => metrics
+        .AddLfuCacheInstrumentation());
+```
+
+Exporter 由宿主应用单独配置。缓存会发布 Counter、ObservableGauge 和淘汰耗时 Histogram，并携带 `keyspace`
+和 `value_type` tag。
+
 ## Sample
 
 运行 Web API sample：

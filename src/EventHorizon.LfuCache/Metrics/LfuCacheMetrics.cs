@@ -6,8 +6,10 @@ namespace EventHorizon.LfuCache.Metrics;
 
 internal sealed class LfuCacheMetrics : IDisposable
 {
+    internal const string MeterName = "EventHorizon.LfuCache";
+
     private readonly LfuCacheRegistry _registry;
-    private readonly Meter _meter = new("EventHorizon.LfuCache");
+    private readonly Meter _meter = new(MeterName);
     private readonly Counter<long> _hits;
     private readonly Counter<long> _misses;
     private readonly Counter<long> _evictions;
