@@ -11,9 +11,10 @@
 - 常规场景使用类型化 `ILfuCache<TKey, TValue>`，动态场景使用非泛型 `ILfuCache`。
 - 支持 keyed service 注册；`default` keyspace 同时支持普通的非 keyed 注入。
 - per-entry 相对过期时间、读取时失效和后台增量清理。
-- 批量 LFU 淘汰，同频次时以 LRU 排序作为次级规则。
-- 频次衰减、新 entry 保护，以及越过 overflow 水位后的同步反压。
+- 批量 LFU 淘汰，以频次为第一排序键、1 秒新 entry 保护为第二排序键、LRU 为第三排序键。
+- 基于时间的频次衰减；读取和淘汰时惰性归一，后台维护增量提前归一。
 - 同一 key 并发调用 `GetOrAdd` / `GetOrAddAsync` 时 factory 只执行一次。
+- 每个 keyspace 可限制正在运行的 factory 数量，同 key 调用共享同一个 factory。
 - 通过 named options 进行配置对象整体热更新。
 - 内置统计、指标和结构化日志。
 - 引用类型的 `null` 是合法缓存值。
@@ -88,11 +89,21 @@ services.AddLfuCache<Guid, string>(
         options.Capacity = 10_000;
         options.DefaultExpiry = TimeSpan.FromMinutes(30);
         options.MaintenanceInterval = TimeSpan.FromSeconds(10);
+        options.MaxInflight = 2_000;
     });
 ```
 
 通常在注册时直接配置 keyspace。外部 options 源后续触发变更时，缓存会整体替换一份经过校验的不可变快照；
-运行期非法配置会被拒绝，并继续使用上一份有效快照。
+运行期非法配置会被拒绝，并继续使用上一份有效快照。`MaxInflight` 默认为 `null`，表示继承 `Capacity`；
+正数可以覆盖该限制。
+
+只有为新 key 启动 factory 时，`GetOrAdd` 和 `GetOrAddAsync` 才会占用一个运行中 factory 名额。同 key 的并发
+调用共享已有 factory。keyspace 已达到 `MaxInflight` 时，新 key 会抛出 `InvalidOperationException`；命中和
+`Set` 不占用名额。等待者取消、`Remove` 或 `Clear` 都不会在 factory 仍运行时释放名额，factory 退出时才释放。
+降低限额只影响后续新 key，已有 factory 会继续完成。
+
+`Capacity` 控制 entry 数量的淘汰水位，不是按字节计量，也不是绝对的内存边界；pending factory 或并发操作可能
+让物理 entry 数暂时超过容量。
 
 ## 动态接口
 
@@ -150,13 +161,8 @@ dotnet build EventHorizon.LfuCache.slnx -c Release --no-restore
 dotnet test EventHorizon.LfuCache.slnx -c Release --no-build
 ```
 
-运行 benchmark：
-
-```bash
-dotnet run --project tests/EventHorizon.LfuCache.Benchmarks -c Release -- --filter '*'
-```
-
-benchmark 对比类型化接口、动态接口、`ConcurrentDictionary` 与 `MemoryCache`，并包含容量压力下的淘汰负载。
+benchmark 包含类型化和动态接口、`ConcurrentDictionary` 与 `MemoryCache` 对比、容量压力淘汰、压力写入、多线程
+负载和确定性策略场景。当前运行方式和前后版本结果见 [benchmark 方法与对比报告](docs/benchmarks.zh-CN.md)。
 
 并发、淘汰、后台维护、配置和可观测性细节见[设计文档](docs/design.zh-CN.md)。
 

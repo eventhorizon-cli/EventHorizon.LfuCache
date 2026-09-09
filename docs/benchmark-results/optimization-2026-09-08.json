@@ -1,0 +1,87 @@
+{
+  "formatVersion": 1,
+  "date": "2026-09-08",
+  "baselineCommit": "3e80b5a",
+  "environment": {
+    "os": "macOS Sequoia 15.7.9",
+    "architecture": "Arm64",
+    "dotnetSdk": "10.0.100",
+    "runtime": "10.0.25.52411",
+    "benchmarkDotNet": "0.15.8"
+  },
+  "scenarios": {
+    "frequencyDecay": {
+      "capacity": 10000,
+      "initialFrequency": 8,
+      "decayIntervalSeconds": 60,
+      "baseline": {
+        "at60Seconds": { "4": 1667, "8": 8333 },
+        "at360Seconds": { "4": 10000 }
+      },
+      "optimized": {
+        "at60Seconds": { "4": 10000 },
+        "at360Seconds": { "1": 10000 }
+      }
+    },
+    "protectedHotKeys": {
+      "capacity": 1000,
+      "hotKeyCount": 1000,
+      "coldKeyCount": 1000,
+      "baselineRetainedHotKeys": 91,
+      "optimizedRetainedHotKeys": 900,
+      "baselineRetentionRate": 0.091,
+      "optimizedRetentionRate": 0.9
+    },
+    "inflightFactories": {
+      "capacity": 1,
+      "requestedFactoryCount": 4,
+      "baselineFactoriesStarted": 4,
+      "baselineCountWhileBlocked": 4,
+      "baselineRejectedInvalidOperationCount": 0,
+      "optimizedFactoriesStarted": 1,
+      "optimizedCountWhileBlocked": 1,
+      "optimizedRejectedInvalidOperationCount": 3
+    }
+  },
+  "capacityPressureOperationsPerInvoke": 16,
+  "capacityPressure": [
+    {
+      "method": "SetExistingKeyAfterPressure",
+      "capacity": 1000,
+      "baselineMean": "291.646 ns",
+      "optimizedMean": "313.438 ns",
+      "baselineAllocated": "64 B",
+      "optimizedAllocated": "64 B"
+    },
+    {
+      "method": "SetNewKeyUnderPressure",
+      "capacity": 1000,
+      "baselineMean": "39.829 us",
+      "optimizedMean": "10.319 us",
+      "baselineAllocated": "625 B",
+      "optimizedAllocated": "110 B"
+    },
+    {
+      "method": "SetExistingKeyAfterPressure",
+      "capacity": 100000,
+      "baselineMean": "796.448 ns",
+      "optimizedMean": "655.417 ns",
+      "baselineAllocated": "64 B",
+      "optimizedAllocated": "64 B"
+    },
+    {
+      "method": "SetNewKeyUnderPressure",
+      "capacity": 100000,
+      "baselineMean": "287.878 us",
+      "optimizedMean": "246.490 us",
+      "baselineAllocated": "50125 B",
+      "optimizedAllocated": "110 B"
+    }
+  ],
+  "directTypedHit": {
+    "baselineMean": "20.108 ns",
+    "optimizedMean": "20.131 ns",
+    "baselineAllocated": "0 B",
+    "optimizedAllocated": "0 B"
+  }
+}

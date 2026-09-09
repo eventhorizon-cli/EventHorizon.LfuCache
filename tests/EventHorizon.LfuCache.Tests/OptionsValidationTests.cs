@@ -17,6 +17,7 @@ public sealed class OptionsValidationTests
             options.DefaultExpiry = TimeSpan.Zero;
             options.MaintenanceInterval = TimeSpan.FromMilliseconds(500);
             options.DecayInterval = TimeSpan.FromHours(25);
+            options.MaxInflight = 0;
         });
         using var provider = services.BuildServiceProvider();
 
@@ -29,6 +30,7 @@ public sealed class OptionsValidationTests
         Assert.Contains(exception.Failures, failure => failure.Contains("DefaultExpiry"));
         Assert.Contains(exception.Failures, failure => failure.Contains("MaintenanceInterval"));
         Assert.Contains(exception.Failures, failure => failure.Contains("DecayInterval"));
+        Assert.Contains(exception.Failures, failure => failure.Contains("MaxInflight"));
     }
 
     [Fact]

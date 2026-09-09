@@ -13,14 +13,18 @@ The current implementation includes:
 - one independent `ConcurrentDictionary<TKey, CacheEntry<TValue>>` per keyspace.
 - a typed interface and a non-generic interface with generic methods, both forwarding to the same dictionary.
 - per-entry expiry, read-time expiration, and incremental background cleanup.
-- proportional batch LFU eviction, with LRU as the secondary order for equal frequencies.
+- proportional batch eviction with time-normalized frequency as the primary order, new-entry protection as the
+  secondary order, and LRU as the tertiary order.
 - a capacity overflow watermark and synchronous eviction backpressure.
-- frequency decay and new-entry protection.
+- time-based frequency decay with lazy normalization and incremental maintenance work.
+- a per-keyspace limit for concurrently running factories, with same-key factory sharing.
 - whole-object hot reload of named options.
 - one background maintenance loop, statistics, metrics, and structured logging.
 - single-key stampede protection for `GetOrAdd` / `GetOrAddAsync`.
 
-It does not include distributed consistency, persistence, byte-based accounting, or application integration logic.
+It does not include distributed consistency, persistence, byte-based accounting, an absolute memory bound, or
+application integration logic. `Capacity` is an entry-count eviction watermark; pending factories and concurrent
+operations can temporarily put the physical entry count above it.
 The repository's generic Web API sample demonstrates keyed injection with `[FromKeyedServices("sample")]`.
 
 ## 2. Keyspaces and Type Constraints
@@ -40,7 +44,8 @@ combination throws `InvalidOperationException` immediately. To cache another typ
 This constraint guarantees that:
 
 - `Capacity` is the capacity of the entire keyspace and does not need to be summed across type combinations.
-- LFU ordering covers every entry in the keyspace and is exact LFU.
+- Eviction ordering uses a time-normalized frequency for every observed entry in the keyspace; concurrent
+  enumeration is weakly consistent and does not provide a linearizable global "coldest" snapshot.
 - Keys and values retain their actual generic types, with no `object` backing store and no boxing of value types.
 - The dynamic entry point can forward only to the type combination registered for the keyspace; it cannot lazily
   create a dictionary per call.
@@ -164,6 +169,7 @@ public sealed class LfuCacheOptions
     public TimeSpan MaintenanceInterval { get; set; } = TimeSpan.FromSeconds(10);
     public TimeSpan DecayInterval { get; set; } = TimeSpan.FromMinutes(1);
     public double OverflowRatio { get; set; } = 0.05;
+    public int? MaxInflight { get; set; }
 }
 ```
 
@@ -181,12 +187,13 @@ services.AddLfuCache<Guid, string>(
 
 | Parameter | Meaning |
 | --- | --- |
-| `Capacity` | Entry capacity of the keyspace |
+| `Capacity` | Entry-count eviction watermark for the keyspace; not a byte budget or absolute memory bound |
 | `EvictionRatio` | Proportion of capacity evicted in one batch |
 | `DefaultExpiry` | Relative expiry used when an entry expiry is not supplied; `null` means no expiry by default |
 | `MaintenanceInterval` | Incremental background expiration scan interval |
-| `DecayInterval` | Access-frequency half-life |
+| `DecayInterval` | Logical access-frequency half-life measured by the injected `TimeProvider` |
 | `OverflowRatio` | Proportion by which the cache may temporarily exceed capacity during background eviction |
+| `MaxInflight` | Maximum number of factories running for new keys in this keyspace; `null` inherits `Capacity` |
 
 ### 4.1 Validation
 
@@ -196,6 +203,7 @@ services.AddLfuCache<Guid, string>(
 - `DefaultExpiry` is unset or greater than zero
 - `1s <= MaintenanceInterval <= 1h`
 - `1s <= DecayInterval <= 24h`
+- `MaxInflight` is unset or at least `1`
 
 The maintenance service eagerly resolves every cache when the host starts; the cache constructor validates the
 complete named options instance, so invalid configuration causes host startup to fail. Invalid runtime
@@ -217,6 +225,10 @@ maintenance loop, or write a configuration-change log.
 | `EvictionRatio` / `OverflowRatio` | Subsequent eviction uses the new watermarks |
 | `DefaultExpiry` | Affects only subsequent writes; existing entries are not modified |
 | `MaintenanceInterval` / `DecayInterval` | Recalculate the next execution time from the change time and wake the maintenance loop |
+| `MaxInflight` | The new limit applies to subsequent new-key factories; already running factories are allowed to finish. When `null`, it follows the current `Capacity` |
+
+Frequency state retains the rounds that have already elapsed when options change. If `DecayInterval` changes, the next
+decay schedule starts at the change time; it does not reset existing frequency counts or discard elapsed rounds.
 
 The scan budget for one pass is derived from `Capacity`, `DefaultExpiry`, and `MaintenanceInterval`, with the goal
 of completing one full scan within `min(DefaultExpiry, 1min)`; when expiry is not configured, a one-minute window is
@@ -266,6 +278,8 @@ LfuCache<TKey, TValue>
 ├── ConcurrentDictionary<TKey, CacheEntry<TValue>> entries
 ├── long count
 ├── int evictionGate
+├── reusable candidate PriorityQueue
+├── striped hit/miss counters
 ├── expiration scan cursor
 └── decay scan cursor
 ```
@@ -282,19 +296,24 @@ Completed entries are stored as follows:
 internal sealed class CacheEntry<TValue>
 {
     public TValue Value;
-    public long Frequency;
+    public long FrequencyState; // packed uint saturated frequency + uint decay round
     public long LastAccessTicks;
     public long CreatedTicks;
     public long ExpiresAtTicks;
 }
 ```
 
-`Frequency` starts at 1 and is incremented atomically on a hit. `LastAccessTicks` is the LRU secondary order for
-equal frequencies, `CreatedTicks` is used for new-entry protection, and `long.MaxValue` means never expires.
+The lower and upper 32-bit fields of `FrequencyState` contain a saturating frequency count and the last logical decay
+round observed by that entry. A hit and any lazy normalization use a CAS loop over this single packed word. The count
+starts at 1, saturates at `uint.MaxValue`, and is reduced once for every elapsed logical round with a lower bound of 1.
+The logical round is derived from elapsed time supplied by `TimeProvider`; it is not advanced only by the maintenance
+thread. `LastAccessTicks` is the LRU order for equal frequency and protection state, `CreatedTicks` determines the
+one-second protection state, and `long.MaxValue` means never expires.
 
 Stampede-protection state is also stored in the same primary dictionary; no second entry dictionary is created.
 `TryGet` does not treat an incomplete factory as a hit; concurrent `GetOrAdd` calls share the single-execution state
-in that entry.
+in that entry. The striped hit and miss counters are summed when stats are requested, so a stats snapshot is not a
+linearizable point-in-time observation.
 
 ### 6.2 Reference-Checked Removal
 
@@ -319,7 +338,8 @@ treated as `DateTime.UtcNow.Ticks`.
 
 1. Call `TryGetValue`; if the entry does not exist or its factory is incomplete, record a miss.
 2. If `now >= ExpiresAtTicks`, remove it by reference, record an expiration on success, and return a miss.
-3. Atomically increment `Frequency` and update `LastAccessTicks`.
+3. Lazily normalize `FrequencyState` for every elapsed decay round, then atomically increment its saturated count and
+   update `LastAccessTicks`.
 4. Record a hit and return `Value`; the value may be `null`.
 
 The hit path acquires no explicit lock.
@@ -329,15 +349,21 @@ The hit path acquires no explicit lock.
 1. An explicit expiry takes precedence; otherwise read the current snapshot's `DefaultExpiry`. A `null` argument uses
    the default, an explicit `TimeSpan.Zero` means that entry never expires, and negative values are rejected.
 2. Add or replace the entry using a CAS loop.
-3. Preserve the old entry's frequency on replacement; increment `count` for a new entry.
+3. Preserve the old entry's packed frequency state on replacement; increment `count` for a new entry.
 4. When `count` exceeds capacity, wake background maintenance; when it exceeds the hard limit, the writing thread
    attempts synchronous eviction.
 
 ### 7.3 `GetOrAdd`
 
-Concurrent calls for the same key execute the factory only once. After the factory succeeds, the original entry is
-atomically published as complete; on failure or cancellation, remove the entry by reference so subsequent calls can
-retry.
+Concurrent calls for the same key execute the factory only once. A call that finds an existing in-flight factory joins
+it and does not consume another slot. A call for a new key first claims one of the keyspace's `MaxInflight` slots; if
+no slot is available, it throws `InvalidOperationException`. `null` means the limit is the keyspace `Capacity`, while
+a positive value overrides it. Hits and ordinary `Set` operations do not consume slots.
+
+After the factory succeeds, the original entry is atomically published as complete; on failure or cancellation, remove
+the entry by reference so subsequent calls can retry. A slot remains occupied until the factory exits, even when every
+waiter has canceled or `Remove`/`Clear` has detached the entry. Lowering `MaxInflight` does not cancel or evict running
+factories; it only rejects later new-key calls that would exceed the new limit.
 
 Each asynchronous caller's cancellation token cancels only that caller's wait. The factory receives a shared token,
 which is canceled only after every current waiter has canceled. Cache hits return a synchronously completed
@@ -370,7 +396,13 @@ A failed maintenance pass is logged and retried after a bounded delay so a perma
 hot loop.
 
 Expiration and decay each maintain a weakly consistent enumeration cursor. Each pass advances within its budget and
-the next pass resumes from the previous position. All physical removals still use reference checks.
+the next pass resumes from the previous position. Decay maintenance only pre-normalizes the entries it observes;
+logical decay remains correct when an entry is first observed by a read or eviction after several intervals, because all
+elapsed rounds are applied at once. All physical removals still use reference checks.
+
+The frequency state stores a logical time round rather than a maintenance-pass count. If maintenance is delayed, the
+next read, eviction, or scan catches up every elapsed round. Changing `DecayInterval` preserves already elapsed rounds
+and starts a new schedule from the options-change time.
 
 ## 9. Batch Eviction
 
@@ -384,26 +416,34 @@ A keyspace uses three watermarks:
 
 The eviction process:
 
-1. Enumerate the unique dictionary and first remove expired entries by reference.
+1. Enumerate the unique dictionary once. During that enumeration, remove expired entries by reference, lazily
+   normalize each observed frequency, and feed eligible entries into the reusable per-keyspace candidate queue.
 2. Compute how many entries, `k`, must be removed to reach target from the current count.
-3. Use a max-heap of capacity `k` to select candidates with the smallest `(Frequency, LastAccessTicks)`, avoiding a
-   full sort.
-4. Remove candidates by reference and update eviction and batch statistics.
+3. Use the queue, whose bounded candidate set is maintained as a max-heap, to select the smallest
+   `(Frequency, Protected, LastAccessTicks)` values without a full sort. Frequency is primary; an entry outside the
+   one-second protection window is selected before a protected entry at the same frequency; LRU is the third order.
+4. Remove candidates by reference and update eviction and batch statistics. A `finally` block clears the queue so it
+   does not retain key or entry references between batches.
 
-Entries created less than one second ago do not participate in the first candidate selection round. If there are not
-enough other candidates, include these entries so eviction can make progress.
+New entries are therefore protected only as a same-frequency tie-breaker. A new low-frequency entry cannot displace an
+older high-frequency entry merely because it is protected. If there are not enough eligible candidates, protected
+entries are included so eviction can make progress.
 
 Entries whose factory is still running are never eviction candidates. If capacity pressure consists only of pending
 entries, eviction schedules a later retry; each factory completion also rechecks the watermarks.
 
-At every `DecayInterval`, incremental scanning shifts frequencies right by one, with a lower bound of 1.
+The hard-limit path can make the writing thread pay the full synchronous batch cost. The candidate set is bounded and
+the algorithm remains `O(N log k)`, but synchronous backpressure does not make that cost disappear.
+
+Frequency decay is logical: each elapsed `DecayInterval` halves the normalized count with a lower bound of 1. Reads,
+eviction, and incremental maintenance apply the same normalization through the packed CAS state.
 
 | Operation | Complexity |
 | --- | --- |
 | Typed `TryGet` | Average `O(1)` |
 | Dynamic `TryGet` | Average `O(1)`, plus one registry lookup |
 | `Set` | Average `O(1)`; may evict synchronously when crossing the hard limit |
-| Eviction batch | `O(N log k)` |
+| Eviction batch | `O(N log k)` for one weakly consistent enumeration and bounded candidate queue |
 | Maintenance scan | `O(scan budget)` |
 
 ## 10. Observability
@@ -418,6 +458,9 @@ hosts subscribe to it with `MeterProviderBuilder.AddLfuCacheInstrumentation()`:
 
 Metrics carry `keyspace` and `value_type` tags.
 
+Hit and miss totals use internal striped counters. `GetStats()` sums the stripes, avoiding one shared atomic write
+location on the read hot path; the resulting stats snapshot is approximate with respect to concurrent operations.
+
 Log levels:
 
 - Information: whole-object configuration replacement and eviction-batch summaries.
@@ -428,18 +471,25 @@ Log levels:
 
 Core behavior:
 
-- LFU ordering is correct; LRU is the secondary order for equal frequencies.
+- Eviction uses time-normalized frequency first, then one-second protection, then LRU; concurrent enumeration is
+  weakly consistent rather than a linearizable global ordering.
 - A `null` hit can be distinguished from a miss.
 - Explicit expiry overrides the default expiry; both read-time and background expiration work correctly.
 - Replacing a value preserves its existing frequency.
 - After capacity is exceeded, one eviction reaches target; continued writes between target and capacity do not
   trigger another batch.
 - The hard limit triggers synchronous eviction.
-- New-entry protection and the fallback path when candidates are insufficient both make progress.
-- Frequency is halved per interval with a lower bound of 1.
+- New-entry protection is only a same-frequency tie-breaker, and the fallback path when candidates are insufficient
+  still makes progress.
+- Frequency is normalized for every elapsed logical interval with a lower bound of 1, even when maintenance was delayed.
+- A decay-interval change preserves elapsed rounds and starts the next schedule at the change time.
+- Expiration reclamation and candidate selection share one dictionary enumeration, and the per-keyspace candidate queue
+  does not retain references after a batch.
 - Whole-object configuration hot reload takes effect; invalid configuration preserves the old snapshot.
 - Reference-checked removal does not delete a newer value written later.
 - Concurrent `GetOrAdd` calls execute the factory once, and a failure can be retried.
+- `MaxInflight` rejects excess new-key factories, while same-key callers share a factory and running factories retain
+  their slots until exit.
 
 DI and dynamic entry point:
 

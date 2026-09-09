@@ -11,9 +11,11 @@ by keyspace, expires entries independently, and evicts cold entries in proportio
 - Typed `ILfuCache<TKey, TValue>` API for normal use and non-generic `ILfuCache` for dynamic scenarios.
 - Keyed-service registration; the `default` keyspace also supports ordinary, non-keyed injection.
 - Per-entry relative expiry, read-time expiration, and incremental background cleanup.
-- Batch LFU eviction with LRU ordering as the tie-breaker.
-- Frequency decay, new-entry protection, and synchronous backpressure above the overflow watermark.
+- Batch LFU eviction with frequency as the primary order, one-second new-entry protection as the secondary order,
+  and LRU as the tertiary order.
+- Time-based frequency decay with lazy normalization on reads and eviction, plus incremental maintenance work.
 - Single-execution `GetOrAdd` and `GetOrAddAsync` for concurrent callers of the same key.
+- A per-keyspace limit for concurrently running factories, with same-key sharing.
 - Whole-object hot reload through named options.
 - Built-in statistics, metrics, and structured logging.
 - `null` is a valid cached value for reference types.
@@ -90,12 +92,22 @@ services.AddLfuCache<Guid, string>(
         options.Capacity = 10_000;
         options.DefaultExpiry = TimeSpan.FromMinutes(30);
         options.MaintenanceInterval = TimeSpan.FromSeconds(10);
+        options.MaxInflight = 2_000;
     });
 ```
 
 Configure a keyspace directly at registration. If an external options source later produces a change, the cache
 replaces its validated immutable snapshot; invalid runtime values are rejected and the previous snapshot remains
-active.
+active. `MaxInflight` defaults to `null`, which inherits `Capacity`; a positive value overrides that limit.
+
+`GetOrAdd` and `GetOrAddAsync` consume an in-flight slot only when they start a factory for a new key. Concurrent
+callers for the same key share the existing factory. A new key whose keyspace has reached `MaxInflight` throws
+`InvalidOperationException`; cache hits and `Set` do not consume a slot. Cancellation of a waiter, `Remove`, or
+`Clear` does not release a slot while its factory is still running. A factory releases its slot only when it exits.
+Lowering the limit lets existing factories finish and affects subsequent new-key calls.
+
+`Capacity` controls entry-count eviction watermarks. It is not a byte budget or an absolute memory boundary, and
+pending factories or concurrent operations may temporarily put the physical entry count above the capacity.
 
 ## Dynamic API
 
@@ -156,14 +168,10 @@ dotnet build EventHorizon.LfuCache.slnx -c Release --no-restore
 dotnet test EventHorizon.LfuCache.slnx -c Release --no-build
 ```
 
-Run the benchmark suite with:
-
-```bash
-dotnet run --project tests/EventHorizon.LfuCache.Benchmarks -c Release -- --filter '*'
-```
-
-The benchmarks compare typed and dynamic cache operations with `ConcurrentDictionary` and `MemoryCache`, and include a
-capacity-pressure eviction workload.
+The benchmark suite includes typed and dynamic operations, `ConcurrentDictionary` and `MemoryCache` comparisons,
+capacity-pressure eviction, pressure writes, multi-threaded workloads, and deterministic policy scenarios. See the
+[benchmark methodology and before/after comparison report](docs/benchmarks.md) for the current run instructions and
+results.
 
 See the [design document](docs/design.md) for concurrency, eviction, maintenance, configuration, and observability
 details.

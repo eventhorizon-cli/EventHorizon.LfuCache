@@ -122,6 +122,7 @@ public sealed class EvictionTests
         var options = new LfuCacheOptions
         {
             Capacity = 1,
+            MaxInflight = 2,
             OverflowRatio = 0,
             MaintenanceInterval = TimeSpan.FromSeconds(1),
             DecayInterval = TimeSpan.FromMinutes(1),

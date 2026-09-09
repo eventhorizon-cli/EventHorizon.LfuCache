@@ -26,6 +26,11 @@ internal sealed class LfuCacheOptionsValidator : IValidateOptions<LfuCacheOption
             errors.Add("Capacity must be at least 1.");
         }
 
+        if (options.MaxInflight is < 1)
+        {
+            errors.Add("MaxInflight must be positive when specified.");
+        }
+
         if (options.EvictionRatio is <= 0 or > 0.5 || double.IsNaN(options.EvictionRatio))
         {
             errors.Add("EvictionRatio must be greater than 0 and no greater than 0.5.");

@@ -66,6 +66,7 @@ public sealed class ConcurrencyTests
             {
                 options.Capacity = 1;
                 options.OverflowRatio = 0;
+                options.MaxInflight = 2;
             });
         var firstStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var secondStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -269,6 +270,7 @@ public sealed class ConcurrencyTests
             {
                 options.Capacity = 1;
                 options.OverflowRatio = 0;
+                options.MaxInflight = 3;
             });
         var firstStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var secondStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -313,6 +315,36 @@ public sealed class ConcurrencyTests
             release.TrySetResult(true);
             await Task.WhenAll(callers);
         }
+    }
+
+    [Fact]
+    public async Task GetOrAddAsync_MaxInflightReached_RejectsNewKeyWithoutAddingEntry()
+    {
+        using var host = new TestCacheHost<int, string>(
+            configure: options =>
+            {
+                options.Capacity = 4;
+                options.MaxInflight = 2;
+                options.OverflowRatio = 0;
+            });
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        async ValueTask<string> Factory(int key, CancellationToken cancellationToken)
+        {
+            await release.Task.WaitAsync(cancellationToken);
+            return $"value-{key}";
+        }
+
+        var first = host.Cache.GetOrAddAsync(1, Factory, cancellationToken: TestContext.Current.CancellationToken).AsTask();
+        var second = host.Cache.GetOrAddAsync(2, Factory, cancellationToken: TestContext.Current.CancellationToken).AsTask();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await host.Cache.GetOrAddAsync(3, Factory, cancellationToken: TestContext.Current.CancellationToken));
+
+        Assert.Equal(2, host.Cache.Count);
+        release.TrySetResult(true);
+        await Task.WhenAll(first, second);
+        Assert.Equal(2, host.Cache.Count);
     }
 
     [Fact]

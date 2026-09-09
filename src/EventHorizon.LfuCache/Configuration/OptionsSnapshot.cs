@@ -10,9 +10,12 @@ internal sealed class OptionsSnapshot
         long hardLimit,
         int scanBudget,
         long maintenanceIntervalTicks,
-        long decayIntervalTicks)
+        long decayIntervalTicks,
+        long decayOriginTicks,
+        uint decayOriginEpoch)
     {
         Capacity = source.Capacity;
+        MaxInflight = source.MaxInflight;
         EvictionRatio = source.EvictionRatio;
         DefaultExpiry = source.DefaultExpiry;
         MaintenanceInterval = source.MaintenanceInterval;
@@ -23,9 +26,16 @@ internal sealed class OptionsSnapshot
         ScanBudget = scanBudget;
         MaintenanceIntervalTicks = maintenanceIntervalTicks;
         DecayIntervalTicks = decayIntervalTicks;
+        DecayOriginTicks = decayOriginTicks;
+        DecayOriginEpoch = decayOriginEpoch;
+        FirstDecayBoundaryTicks = TimestampMath.Add(decayOriginTicks, decayIntervalTicks);
     }
 
     public int Capacity { get; }
+
+    public int? MaxInflight { get; }
+
+    public int InflightLimit => MaxInflight ?? Capacity;
 
     public double EvictionRatio { get; }
 
@@ -47,7 +57,16 @@ internal sealed class OptionsSnapshot
 
     public long DecayIntervalTicks { get; }
 
-    public static OptionsSnapshot Create(LfuCacheOptions options, TimeProvider timeProvider)
+    private long DecayOriginTicks { get; }
+
+    private uint DecayOriginEpoch { get; }
+
+    private long FirstDecayBoundaryTicks { get; }
+
+    public static OptionsSnapshot Create(
+        LfuCacheOptions options,
+        TimeProvider timeProvider,
+        OptionsSnapshot? previous = null)
     {
         var evictionCount = Math.Max(1, (int)Math.Ceiling(options.Capacity * options.EvictionRatio));
         var targetLimit = Math.Max(0, options.Capacity - evictionCount);
@@ -59,6 +78,12 @@ internal sealed class OptionsSnapshot
             1L,
             (long)Math.Floor(sweepWindow.TotalSeconds / options.MaintenanceInterval.TotalSeconds));
         var scanBudget = Math.Max(1, SaturatingCeilingDivide(options.Capacity, scansPerSweep));
+        var nowTicks = timeProvider.GetTimestamp();
+        var preserveDecayOrigin = previous is not null && previous.DecayInterval == options.DecayInterval;
+        var decayOriginTicks = preserveDecayOrigin ? previous!.DecayOriginTicks : nowTicks;
+        var decayOriginEpoch = preserveDecayOrigin
+            ? previous!.DecayOriginEpoch
+            : previous?.GetFrequencyEpoch(nowTicks) ?? 0;
 
         return new OptionsSnapshot(
             options,
@@ -66,12 +91,27 @@ internal sealed class OptionsSnapshot
             hardLimit,
             scanBudget,
             TimestampMath.ToTimestampTicks(options.MaintenanceInterval, timeProvider),
-            TimestampMath.ToTimestampTicks(options.DecayInterval, timeProvider));
+            TimestampMath.ToTimestampTicks(options.DecayInterval, timeProvider),
+            decayOriginTicks,
+            decayOriginEpoch);
+    }
+
+    public uint GetFrequencyEpoch(long nowTicks)
+    {
+        if (nowTicks < FirstDecayBoundaryTicks)
+        {
+            return DecayOriginEpoch;
+        }
+
+        var elapsedTicks = Math.Max(0, nowTicks - DecayOriginTicks);
+        var epoch = unchecked(DecayOriginEpoch + (uint)(elapsedTicks / DecayIntervalTicks));
+        return epoch;
     }
 
     public bool HasSameValues(LfuCacheOptions options)
     {
         return Capacity == options.Capacity
+            && MaxInflight == options.MaxInflight
             && EvictionRatio.Equals(options.EvictionRatio)
             && DefaultExpiry == options.DefaultExpiry
             && MaintenanceInterval == options.MaintenanceInterval

@@ -24,6 +24,10 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
     private readonly KeyValuePair<string, object?>[] _metricTags;
     private readonly object _scanGate = new();
     private readonly long _protectionWindowTicks;
+    private readonly PriorityQueue<EvictionCandidate<TKey, TValue>, EvictionPriority> _evictionCandidates =
+        new(WorstEvictionPriorityComparer.Instance);
+    private readonly StripedCounter _hits = new();
+    private readonly StripedCounter _misses = new();
 
     private LfuCacheStoreState<TKey, TValue> _state = new();
     private OptionsSnapshot _snapshot;
@@ -32,13 +36,12 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
     private long _nextMaintenanceTicks;
     private long _nextDecayTicks;
     private long _nextEvictionTicks = long.MaxValue;
-    private long _hits;
-    private long _misses;
     private long _evictions;
     private long _expirations;
     private long _evictionBatches;
     private int _evictionGate;
     private int _capacityContraction;
+    private int _inflightCount;
     private int _disposed;
 
     public LfuCache(
@@ -125,15 +128,17 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
             var snapshot = Volatile.Read(ref _snapshot);
             var nowTicks = _timeProvider.GetTimestamp();
             var expiresAtTicks = GetExpiresAtTicks(expiry, snapshot, nowTicks);
+            var frequencyEpoch = snapshot.GetFrequencyEpoch(nowTicks);
 
             if (state.Entries.TryGetValue(key, out var observed))
             {
                 var isLive = observed.IsCompleted && nowTicks < Volatile.Read(ref observed.ExpiresAtTicks);
-                var frequency = isLive ? Math.Max(1, Volatile.Read(ref observed.Frequency)) : 1;
+                var frequency = isLive ? observed.GetFrequency(frequencyEpoch) : 1;
                 var createdTicks = isLive ? observed.CreatedTicks : nowTicks;
                 var replacement = CacheEntry<TValue>.Completed(
                     value,
                     frequency,
+                    frequencyEpoch,
                     nowTicks,
                     createdTicks,
                     expiresAtTicks);
@@ -145,7 +150,7 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
             }
             else
             {
-                var added = CacheEntry<TValue>.Completed(value, 1, nowTicks, nowTicks, expiresAtTicks);
+                var added = CacheEntry<TValue>.Completed(value, 1, frequencyEpoch, nowTicks, nowTicks, expiresAtTicks);
                 if (!state.Entries.TryAdd(key, added))
                 {
                     continue;
@@ -230,8 +235,8 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
     public LfuCacheStats GetStats()
     {
         return new LfuCacheStats(
-            Volatile.Read(ref _hits),
-            Volatile.Read(ref _misses),
+            _hits.Read(),
+            _misses.Read(),
             Volatile.Read(ref _evictions),
             Volatile.Read(ref _expirations),
             Volatile.Read(ref _evictionBatches),
@@ -264,7 +269,7 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
         var decayDueTicks = Volatile.Read(ref _nextDecayTicks);
         if (nowTicks >= decayDueTicks)
         {
-            decayed = ScanForDecay(snapshot.ScanBudget);
+            decayed = ScanForDecay(snapshot.ScanBudget, snapshot.GetFrequencyEpoch(nowTicks));
             var activeSnapshot = Volatile.Read(ref _snapshot);
             Interlocked.CompareExchange(
                 ref _nextDecayTicks,
@@ -320,8 +325,7 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
                         continue;
                     }
 
-                    Interlocked.Increment(ref observed.Frequency);
-                    Volatile.Write(ref observed.LastAccessTicks, nowTicks);
+                    observed.RecordAccess(Volatile.Read(ref _snapshot).GetFrequencyEpoch(nowTicks), nowTicks);
                     RecordHit();
                     return observed.Value;
                 }
@@ -337,6 +341,14 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
                 return await waitTask.ConfigureAwait(false);
             }
 
+            var slotLimit = Volatile.Read(ref _snapshot).InflightLimit;
+            if (!TryAcquireInflightSlot(slotLimit))
+            {
+                throw new InvalidOperationException(
+                    $"LFU cache keyspace '{Keyspace}' has reached its MaxInflight limit of {slotLimit} running factories.");
+            }
+
+            var slot = new InflightSlot(this);
             CacheEntry<TValue>? pendingEntry = null;
             var operation = new InflightOperation<TValue>(
                 factoryCancellationToken => RunFactoryAndPublishAsync(
@@ -345,12 +357,18 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
                     pendingEntry!,
                     factory,
                     expiry,
+                    slot,
                     factoryCancellationToken),
                 () => RemoveObserved(state, key, pendingEntry!));
-            pendingEntry = CacheEntry<TValue>.Pending(operation, _timeProvider.GetTimestamp());
+            var createdTicks = _timeProvider.GetTimestamp();
+            pendingEntry = CacheEntry<TValue>.Pending(
+                operation,
+                createdTicks,
+                Volatile.Read(ref _snapshot).GetFrequencyEpoch(createdTicks));
 
             if (!state.Entries.TryAdd(key, pendingEntry))
             {
+                slot.Dispose();
                 operation.Dispose();
                 continue;
             }
@@ -361,6 +379,7 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
             {
                 RemoveObserved(state, key, pendingEntry);
                 operation.AbandonOwner();
+                slot.Dispose();
                 continue;
             }
 
@@ -372,6 +391,7 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
             catch
             {
                 operation.AbandonOwner();
+                slot.Dispose();
                 throw;
             }
 
@@ -409,8 +429,7 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
                 return false;
             }
 
-            Interlocked.Increment(ref entry.Frequency);
-            Volatile.Write(ref entry.LastAccessTicks, nowTicks);
+            entry.RecordAccess(Volatile.Read(ref _snapshot).GetFrequencyEpoch(nowTicks), nowTicks);
             RecordHit();
             value = entry.Value;
             return true;
@@ -423,6 +442,7 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
         CacheEntry<TValue> pendingEntry,
         Func<TKey, CancellationToken, ValueTask<TValue>> factory,
         TimeSpan? expiry,
+        InflightSlot slot,
         CancellationToken cancellationToken)
     {
         try
@@ -430,9 +450,11 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
             var value = await factory(key, cancellationToken).ConfigureAwait(false);
             var snapshot = Volatile.Read(ref _snapshot);
             var nowTicks = _timeProvider.GetTimestamp();
+            var frequencyEpoch = snapshot.GetFrequencyEpoch(nowTicks);
             var completed = CacheEntry<TValue>.Completed(
                 value,
-                Math.Max(1, Volatile.Read(ref pendingEntry.Frequency)),
+                pendingEntry.GetFrequency(frequencyEpoch),
+                frequencyEpoch,
                 nowTicks,
                 pendingEntry.CreatedTicks,
                 GetExpiresAtTicks(expiry, snapshot, nowTicks));
@@ -449,6 +471,40 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
         {
             RemoveObserved(state, key, pendingEntry);
             throw;
+        }
+        finally
+        {
+            slot.Dispose();
+        }
+    }
+
+    private bool TryAcquireInflightSlot(int limit)
+    {
+        var count = Volatile.Read(ref _inflightCount);
+        while (count < limit)
+        {
+            var observed = Interlocked.CompareExchange(ref _inflightCount, count + 1, count);
+            if (observed == count)
+            {
+                return true;
+            }
+
+            count = observed;
+        }
+
+        return false;
+    }
+
+    private sealed class InflightSlot(LfuCache<TKey, TValue> owner) : IDisposable
+    {
+        private int _released;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _released, 1) == 0)
+            {
+                Interlocked.Decrement(ref owner._inflightCount);
+            }
         }
     }
 
@@ -477,7 +533,7 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
                 return;
             }
 
-            var replacement = OptionsSnapshot.Create(options, _timeProvider);
+            var replacement = OptionsSnapshot.Create(options, _timeProvider, current);
             Volatile.Write(ref _snapshot, replacement);
             var nowTicks = _timeProvider.GetTimestamp();
 
@@ -605,18 +661,14 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
             var targetForBatch = Volatile.Read(ref _capacityContraction) != 0
                 ? Math.Max(snapshot.Capacity, countBefore - batchSize)
                 : snapshot.TargetLimit;
-            var expired = RemoveExpiredDuringEviction(state, nowTicks, targetForBatch);
-            var required = Math.Max(0L, Volatile.Read(ref state.Count) - targetForBatch);
-            long minFrequency = 0;
-            long maxFrequency = 0;
-            var evicted = required == 0
-                ? 0
-                : SelectAndRemoveCandidates(
-                    state,
-                    SaturatingInt(required),
-                    nowTicks,
-                    out minFrequency,
-                    out maxFrequency);
+            var evicted = SelectAndRemoveCandidates(
+                state,
+                targetForBatch,
+                nowTicks,
+                snapshot.GetFrequencyEpoch(nowTicks),
+                out var expired,
+                out var minFrequency,
+                out var maxFrequency);
             stopwatch.Stop();
 
             Interlocked.Increment(ref _evictionBatches);
@@ -647,64 +699,88 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
         }
         finally
         {
+            // The queue belongs to the eviction gate. Always release retained keys and values, including on failure.
+            _evictionCandidates.Clear();
             Volatile.Write(ref _evictionGate, 0);
         }
     }
 
-    private int RemoveExpiredDuringEviction(
+    private int SelectAndRemoveCandidates(
         LfuCacheStoreState<TKey, TValue> state,
+        long target,
         long nowTicks,
-        long targetForBatch)
+        uint frequencyEpoch,
+        out int expired,
+        out long minFrequency,
+        out long maxFrequency)
     {
-        var removed = 0;
-
+        var queue = _evictionCandidates;
+        expired = 0;
         foreach (var pair in state.Entries)
         {
-            if (Volatile.Read(ref state.Count) <= targetForBatch)
+            var required = SaturatingInt(Math.Max(0, Volatile.Read(ref state.Count) - target));
+            if (required == 0)
             {
                 break;
             }
 
-            if (pair.Value.IsCompleted
-                && nowTicks >= Volatile.Read(ref pair.Value.ExpiresAtTicks)
-                && RemoveExpired(state, pair.Key, pair.Value))
+            var entry = pair.Value;
+            if (!entry.IsCompleted)
             {
-                removed++;
+                continue;
+            }
+
+            if (nowTicks >= Volatile.Read(ref entry.ExpiresAtTicks))
+            {
+                if (RemoveExpired(state, pair.Key, entry))
+                {
+                    expired++;
+                }
+
+                continue;
+            }
+
+            while (queue.Count > required)
+            {
+                queue.Dequeue();
+            }
+
+            var priority = new EvictionPriority(
+                entry.GetFrequency(frequencyEpoch),
+                nowTicks - entry.CreatedTicks < _protectionWindowTicks,
+                Volatile.Read(ref entry.LastAccessTicks));
+            var candidate = new EvictionCandidate<TKey, TValue>(pair.Key, entry);
+
+            if (queue.Count < required)
+            {
+                queue.Enqueue(candidate, priority);
+                continue;
+            }
+
+            queue.TryPeek(out _, out var worstPriority);
+            if (priority.CompareTo(worstPriority) < 0)
+            {
+                queue.DequeueEnqueue(candidate, priority);
             }
         }
 
-        return removed;
-    }
-
-    private int SelectAndRemoveCandidates(
-        LfuCacheStoreState<TKey, TValue> state,
-        int required,
-        long nowTicks,
-        out long minFrequency,
-        out long maxFrequency)
-    {
-        var queue = new PriorityQueue<EvictionCandidate<TKey, TValue>, EvictionPriority>(
-            required,
-            WorstEvictionPriorityComparer.Instance);
-        AddCandidates(state, queue, required, nowTicks, includeProtected: false);
-
-        if (queue.Count < required)
+        var remaining = SaturatingInt(Math.Max(0, Volatile.Read(ref state.Count) - target));
+        while (queue.Count > remaining)
         {
-            AddCandidates(state, queue, required, nowTicks, includeProtected: true, protectedOnly: true);
+            queue.Dequeue();
         }
 
         var removed = 0;
         minFrequency = long.MaxValue;
         maxFrequency = 0;
-
-        while (queue.TryDequeue(out var candidate, out _))
+        while (Volatile.Read(ref state.Count) > target && queue.TryDequeue(out var candidate, out _))
         {
             if (!RemoveObserved(state, candidate.Key, candidate.Entry))
             {
                 continue;
             }
 
-            var frequency = Volatile.Read(ref candidate.Entry.Frequency);
+            var frequency = candidate.Entry.GetFrequency(frequencyEpoch);
             minFrequency = Math.Min(minFrequency, frequency);
             maxFrequency = Math.Max(maxFrequency, frequency);
             removed++;
@@ -718,48 +794,6 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
         return removed;
     }
 
-    private void AddCandidates(
-        LfuCacheStoreState<TKey, TValue> state,
-        PriorityQueue<EvictionCandidate<TKey, TValue>, EvictionPriority> queue,
-        int required,
-        long nowTicks,
-        bool includeProtected,
-        bool protectedOnly = false)
-    {
-        foreach (var pair in state.Entries)
-        {
-            var entry = pair.Value;
-            if (!entry.IsCompleted)
-            {
-                continue;
-            }
-
-            var isProtected = nowTicks - entry.CreatedTicks < _protectionWindowTicks;
-            if ((!includeProtected && isProtected) || (protectedOnly && !isProtected))
-            {
-                continue;
-            }
-
-            var priority = new EvictionPriority(
-                Volatile.Read(ref entry.Frequency),
-                Volatile.Read(ref entry.LastAccessTicks));
-            var candidate = new EvictionCandidate<TKey, TValue>(pair.Key, entry);
-
-            if (queue.Count < required)
-            {
-                queue.Enqueue(candidate, priority);
-                continue;
-            }
-
-            queue.TryPeek(out _, out var worstPriority);
-            if (priority.CompareTo(worstPriority) < 0)
-            {
-                queue.Dequeue();
-                queue.Enqueue(candidate, priority);
-            }
-        }
-    }
-
     private int ScanExpired(int budget, long nowTicks)
     {
         return Scan(
@@ -770,28 +804,12 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
                 && RemoveExpired(state, pair.Key, pair.Value));
     }
 
-    private int ScanForDecay(int budget)
+    private int ScanForDecay(int budget, uint frequencyEpoch)
     {
         return Scan(
             ref _decayCursor,
             budget,
-            (_, pair) =>
-            {
-                if (!pair.Value.IsCompleted)
-                {
-                    return false;
-                }
-
-                while (true)
-                {
-                    var frequency = Volatile.Read(ref pair.Value.Frequency);
-                    var decayed = Math.Max(1, frequency >> 1);
-                    if (Interlocked.CompareExchange(ref pair.Value.Frequency, decayed, frequency) == frequency)
-                    {
-                        return true;
-                    }
-                }
-            });
+            (_, pair) => pair.Value.IsCompleted && pair.Value.Decay(frequencyEpoch));
     }
 
     private int Scan(
@@ -880,13 +898,13 @@ internal sealed class LfuCache<TKey, TValue> : ILfuCache<TKey, TValue>, ILfuCach
 
     private void RecordHit()
     {
-        Interlocked.Increment(ref _hits);
+        _hits.Increment();
         _metrics.Hit(_metricTags);
     }
 
     private void RecordMiss()
     {
-        Interlocked.Increment(ref _misses);
+        _misses.Increment();
         _metrics.Miss(_metricTags);
     }
 

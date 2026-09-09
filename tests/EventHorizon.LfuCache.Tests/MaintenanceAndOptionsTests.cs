@@ -58,9 +58,15 @@ public sealed class MaintenanceAndOptionsTests
         var entries = (System.Collections.IDictionary)state.GetType().GetProperty("Entries")!.GetValue(state)!;
         var hot = entries[1]!;
         var cold = entries[2]!;
+        var snapshot = host.Implementation.GetType()
+            .GetField("_snapshot", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(host.Implementation)!;
+        var epoch = snapshot.GetType().GetMethod("GetFrequencyEpoch")!
+            .Invoke(snapshot, [host.Clock.GetTimestamp()])!;
+        var getFrequency = hot.GetType().GetMethod("GetFrequency")!;
 
-        Assert.Equal(2L, hot.GetType().GetField("Frequency")!.GetValue(hot));
-        Assert.Equal(1L, cold.GetType().GetField("Frequency")!.GetValue(cold));
+        Assert.Equal(2L, getFrequency.Invoke(hot, [epoch]));
+        Assert.Equal(1L, getFrequency.Invoke(cold, [epoch]));
     }
 
     [Fact]

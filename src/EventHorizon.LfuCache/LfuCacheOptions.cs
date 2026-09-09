@@ -11,6 +11,15 @@ public sealed class LfuCacheOptions
     /// <value>A value greater than or equal to 1. The default is 10,000.</value>
     public int Capacity { get; set; } = 10_000;
 
+    /// <summary>Gets or sets the maximum number of concurrently running factories in this keyspace.</summary>
+    /// <value>A positive number, or <see langword="null"/> to use <see cref="Capacity"/>. The default is null.</value>
+    /// <remarks>
+    /// Calls for a key already being loaded share its factory. A new factory exceeding the limit is rejected with
+    /// <see cref="InvalidOperationException"/>. Existing factories retain their slots until they exit, including after
+    /// removal, clearing, cancellation, or a reduction of the configured limit. Cache hits and Set do not use slots.
+    /// </remarks>
+    public int? MaxInflight { get; set; }
+
     /// <summary>Gets or sets the fraction of capacity removed in one eviction batch.</summary>
     /// <value>A value greater than 0 and less than or equal to 0.5. The default is 0.1.</value>
     public double EvictionRatio { get; set; } = 0.1;

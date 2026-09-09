@@ -6,12 +6,16 @@ namespace EventHorizon.LfuCache.Benchmarks;
 [MemoryDiagnoser]
 public class CapacityPressureBenchmarks
 {
-    private const int _capacity = 128;
     private const string _keyspace = "capacity-benchmark";
+    private const int _operationsPerInvocation = 16;
 
     private readonly ReferenceValue _value = new(42);
     private ILfuCache<int, ReferenceValue>? _cache;
     private ServiceProvider? _provider;
+    private int _nextKey;
+
+    [Params(1_000, 100_000)]
+    public int Capacity { get; set; }
 
     [GlobalSetup]
     public void GlobalSetup()
@@ -21,7 +25,7 @@ public class CapacityPressureBenchmarks
             _keyspace,
             options =>
             {
-                options.Capacity = _capacity;
+                options.Capacity = Capacity;
                 options.EvictionRatio = 0.25;
                 options.OverflowRatio = 0;
                 options.DefaultExpiry = null;
@@ -33,19 +37,46 @@ public class CapacityPressureBenchmarks
         _cache = _provider.GetRequiredKeyedService<ILfuCache<int, ReferenceValue>>(_keyspace);
     }
 
-    [Benchmark]
-    public int SetBatchWithCapacityPressure()
+    [IterationSetup]
+    public void IterationSetup()
     {
         _cache!.Clear();
-        for (var key = 0; key < _capacity; key++)
+        for (var key = 0; key < Capacity; key++)
         {
             _cache.Set(key, _value, expiry: null);
         }
 
-        var before = _cache.GetStats().EvictionBatches;
-        _cache.Set(_capacity, _value, expiry: null);
-        var after = _cache.GetStats();
-        return (int)(after.EvictionBatches - before);
+        _ = _cache.TryGet(0, out _);
+        _nextKey = Capacity;
+
+        // Prime the eviction path so subsequent measurements include reused candidate storage.
+        _cache.Set(_nextKey++, _value, expiry: null);
+        while (_cache.Count < Capacity)
+        {
+            _cache.Set(_nextKey++, _value, expiry: null);
+        }
+    }
+
+    [Benchmark(OperationsPerInvoke = _operationsPerInvocation)]
+    public int SetExistingKeyAfterPressure()
+    {
+        for (var operation = 0; operation < _operationsPerInvocation; operation++)
+        {
+            _cache!.Set(0, _value, expiry: null);
+        }
+
+        return _cache!.Count;
+    }
+
+    [Benchmark(OperationsPerInvoke = _operationsPerInvocation)]
+    public int SetNewKeyUnderPressure()
+    {
+        for (var operation = 0; operation < _operationsPerInvocation; operation++)
+        {
+            _cache!.Set(_nextKey++, _value, expiry: null);
+        }
+
+        return _cache!.Count;
     }
 
     [GlobalCleanup]
