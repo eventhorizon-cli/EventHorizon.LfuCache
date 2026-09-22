@@ -1,5 +1,10 @@
 # EventHorizon.LfuCache
 
+[![NuGet](https://img.shields.io/nuget/v/EventHorizon.LfuCache.svg)](https://www.nuget.org/packages/EventHorizon.LfuCache)
+[![Build](https://github.com/eventhorizon-cli/EventHorizon.LfuCache/actions/workflows/dotnet-build.yml/badge.svg)](https://github.com/eventhorizon-cli/EventHorizon.LfuCache/actions/workflows/dotnet-build.yml)
+[![Codecov](https://codecov.io/gh/eventhorizon-cli/EventHorizon.LfuCache/graph/badge.svg)](https://codecov.io/gh/eventhorizon-cli/EventHorizon.LfuCache)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 `EventHorizon.LfuCache` 是一个进程内 LFU 缓存。它集成 Microsoft 的依赖注入机制，按键空间（keyspace）隔离数据，
