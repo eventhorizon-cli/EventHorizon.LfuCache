@@ -23,7 +23,7 @@ public static class LfuCacheServiceCollectionExtensions
     public static IServiceCollection AddLfuCache<TKey, TValue>(this IServiceCollection services)
         where TKey : notnull
     {
-        return AddCore<TKey, TValue>(services, null);
+        return AddCore<TKey, TValue>(services, KeyspaceNames.Default);
     }
 
     /// <summary>Registers an LFU cache in the specified keyspace.</summary>
@@ -37,7 +37,7 @@ public static class LfuCacheServiceCollectionExtensions
         string? keyspace)
         where TKey : notnull
     {
-        return AddCore<TKey, TValue>(services, keyspace);
+        return AddCore<TKey, TValue>(services, KeyspaceNames.Normalize(keyspace));
     }
 
     /// <summary>Registers and configures an LFU cache in the specified keyspace.</summary>
@@ -56,7 +56,7 @@ public static class LfuCacheServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(configureOptions);
 
         var normalized = KeyspaceNames.Normalize(keyspace);
-        AddCore<TKey, TValue>(services, keyspace);
+        AddCore<TKey, TValue>(services, normalized);
         services.Configure(normalized, configureOptions);
         return services;
     }
@@ -77,17 +77,16 @@ public static class LfuCacheServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(configuration);
 
         var normalized = KeyspaceNames.Normalize(keyspace);
-        AddCore<TKey, TValue>(services, keyspace);
+        AddCore<TKey, TValue>(services, normalized);
         services.Configure<LfuCacheOptions>(normalized, configuration);
         return services;
     }
 
-    private static IServiceCollection AddCore<TKey, TValue>(IServiceCollection services, string? keyspace)
+    private static IServiceCollection AddCore<TKey, TValue>(IServiceCollection services, string normalized)
         where TKey : notnull
     {
         ArgumentNullException.ThrowIfNull(services);
 
-        var normalized = KeyspaceNames.Normalize(keyspace);
         var catalog = GetCatalog(services);
         if (catalog is null || !catalog.TryGetRegistration(normalized, out _))
         {
@@ -105,13 +104,13 @@ public static class LfuCacheServiceCollectionExtensions
         services.TryAddSingleton<LfuCacheMetrics>();
         services.TryAddEnumerable(
             ServiceDescriptor.Singleton<IValidateOptions<LfuCacheOptions>, LfuCacheOptionsValidator>());
-        services.TryAddSingleton<TimeProvider>(TimeProvider.System);
+        services.TryAddSingleton(TimeProvider.System);
         if (registrationAdded)
         {
             services.AddOptions<LfuCacheOptions>(normalized).ValidateOnStart();
         }
 
-        if (!services.Any(descriptor => descriptor.ServiceType == typeof(LfuCacheMaintenanceService)))
+        if (services.All(descriptor => descriptor.ServiceType != typeof(LfuCacheMaintenanceService)))
         {
             services.AddSingleton<LfuCacheMaintenanceService>();
             services.AddSingleton<IHostedService>(
@@ -151,14 +150,15 @@ public static class LfuCacheServiceCollectionExtensions
         where TKey : notnull
     {
         var loggerFactory = serviceProvider.GetService<ILoggerFactory>();
+        var registry = serviceProvider.GetRequiredService<LfuCacheRegistry>();
         var cache = new LfuCache<TKey, TValue>(
             keyspace,
             serviceProvider.GetRequiredService<IOptionsMonitor<LfuCacheOptions>>(),
             serviceProvider.GetRequiredService<TimeProvider>(),
-            serviceProvider.GetRequiredService<LfuCacheRegistry>(),
+            registry,
             serviceProvider.GetRequiredService<LfuCacheMetrics>(),
             loggerFactory?.CreateLogger<LfuCache<TKey, TValue>>());
-        serviceProvider.GetRequiredService<LfuCacheRegistry>().Register(keyspace, cache);
+        registry.Register(keyspace, cache);
         return cache;
     }
 
@@ -181,8 +181,8 @@ public static class LfuCacheServiceCollectionExtensions
             KeyedService.AnyKey,
             (serviceProvider, requestedKey) =>
             {
-                var normalized = GetRegisteredKeyspace<TKey, TValue>(serviceProvider, requestedKey);
-                var cache = serviceProvider.GetRequiredKeyedService<ILfuCache<TKey, TValue>>(normalized);
+                var registration = GetRegistration<TKey, TValue>(serviceProvider, requestedKey);
+                var cache = serviceProvider.GetRequiredKeyedService<ILfuCache<TKey, TValue>>(registration.Keyspace);
                 return cache is IDisposable or IAsyncDisposable
                     ? new TypedLfuCacheFacade<TKey, TValue>(cache)
                     : cache;
@@ -191,8 +191,8 @@ public static class LfuCacheServiceCollectionExtensions
             KeyedService.AnyKey,
             (serviceProvider, requestedKey) =>
             {
-                var normalized = GetRegisteredKeyspace(serviceProvider, requestedKey);
-                var cache = serviceProvider.GetRequiredKeyedService<ILfuCache>(normalized);
+                var registration = GetRegistration(serviceProvider, requestedKey);
+                var cache = serviceProvider.GetRequiredKeyedService<ILfuCache>(registration.Keyspace);
                 return cache is IDisposable or IAsyncDisposable
                     ? new DynamicLfuCacheFacade(cache)
                     : cache;
@@ -238,27 +238,25 @@ public static class LfuCacheServiceCollectionExtensions
         }
     }
 
-    private static string GetRegisteredKeyspace<TKey, TValue>(
+    private static LfuCacheRegistration GetRegistration<TKey, TValue>(
         IServiceProvider serviceProvider,
         object? requestedKey)
         where TKey : notnull
     {
-        var normalized = GetRegisteredKeyspace(serviceProvider, requestedKey);
-        var registration = serviceProvider.GetRequiredService<LfuCacheCatalog>();
-        registration.TryGetRegistration(normalized, out var registered);
+        var registration = GetRegistration(serviceProvider, requestedKey);
 
-        if (registered.KeyType != typeof(TKey) || registered.ValueType != typeof(TValue))
+        if (registration.KeyType != typeof(TKey) || registration.ValueType != typeof(TValue))
         {
             throw new InvalidOperationException(
-                $"LFU cache keyspace '{normalized}' is registered for " +
-                $"<{registered.KeyType.Name}, {registered.ValueType.Name}>, not " +
+                $"LFU cache keyspace '{registration.Keyspace}' is registered for " +
+                $"<{registration.KeyType.Name}, {registration.ValueType.Name}>, not " +
                 $"<{typeof(TKey).Name}, {typeof(TValue).Name}>.");
         }
 
-        return normalized;
+        return registration;
     }
 
-    private static string GetRegisteredKeyspace(IServiceProvider serviceProvider, object? requestedKey)
+    private static LfuCacheRegistration GetRegistration(IServiceProvider serviceProvider, object? requestedKey)
     {
         if (requestedKey is not string keyspace)
         {
@@ -267,12 +265,12 @@ public static class LfuCacheServiceCollectionExtensions
 
         var normalized = KeyspaceNames.Normalize(keyspace);
         var catalog = serviceProvider.GetRequiredService<LfuCacheCatalog>();
-        if (!catalog.TryGetRegistration(normalized, out _))
+        if (!catalog.TryGetRegistration(normalized, out var registration))
         {
             throw new InvalidOperationException($"LFU cache keyspace '{normalized}' is not registered.");
         }
 
-        return normalized;
+        return registration;
     }
 
     private static LfuCacheCatalog? GetCatalog(IServiceCollection services)

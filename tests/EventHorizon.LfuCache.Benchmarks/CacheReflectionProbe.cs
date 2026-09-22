@@ -13,12 +13,9 @@ internal static class CacheReflectionProbe
     {
         ArgumentNullException.ThrowIfNull(cache);
 
-        var method = cache.GetType().GetMethod("RunMaintenance", _instanceFlags, [typeof(long)]);
-        if (method is null)
-        {
-            throw new InvalidOperationException(
+        var method = cache.GetType().GetMethod("RunMaintenance", _instanceFlags, [typeof(long)])
+            ?? throw new InvalidOperationException(
                 $"Unable to locate RunMaintenance(long) on {cache.GetType().FullName}.");
-        }
 
         return method.CreateDelegate<Action<long>>(cache);
     }
@@ -52,7 +49,7 @@ internal static class CacheReflectionProbe
                     continue;
                 }
 
-                frequencyAccessor ??= CreateFrequencyAccessor(entry, snapshot, epoch);
+                frequencyAccessor ??= CreateFrequencyAccessor(entry, epoch);
                 var frequency = frequencyAccessor(entry);
                 frequencies.TryGetValue(frequency, out var count);
                 frequencies[frequency] = count + 1;
@@ -72,7 +69,7 @@ internal static class CacheReflectionProbe
         }
     }
 
-    private static Func<object, long> CreateFrequencyAccessor(object entry, object? snapshot, uint epoch)
+    private static Func<object, long> CreateFrequencyAccessor(object entry, uint epoch)
     {
         var entryType = entry.GetType();
         var frequencyField = entryType.GetField("Frequency", _instanceFlags);
