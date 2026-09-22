@@ -119,11 +119,12 @@ jobs:
           VERSION: ${{ steps.version.outputs.value }}
         shell: bash
         run: |
-          package_id="${PACKAGE_ID,,}"
-          package_url="https://api.nuget.org/v3-flatcontainer/$package_id/$VERSION/$package_id.nuspec"
+          package_url="https://www.nuget.org/api/v2/package/$PACKAGE_ID/$VERSION"
 
           for attempt in {1..30}; do
-            if curl --fail --silent --output /dev/null "$package_url"; then
+            http_status="$(curl --fail --silent --show-error --location \
+              --output /dev/null --write-out '%{http_code}' "$package_url" || true)"
+            if [[ "$http_status" == "200" ]]; then
               echo "$PACKAGE_ID $VERSION is available on NuGet."
               exit 0
             fi
